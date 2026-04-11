@@ -1,0 +1,59 @@
+import type { TraceMoeResponse } from "@/types";
+
+const BASE_URL = "https://api.trace.moe";
+
+function getHeaders(): Record<string, string> {
+  const headers: Record<string, string> = {};
+  if (process.env.TRACE_MOE_API_KEY) {
+    headers["x-trace-key"] = process.env.TRACE_MOE_API_KEY;
+  }
+  return headers;
+}
+
+export async function searchByImageUrl(imageUrl: string): Promise<TraceMoeResponse> {
+  const url = `${BASE_URL}/search?url=${encodeURIComponent(imageUrl)}&cutBorders=true`;
+  const response = await fetch(url, { headers: getHeaders() });
+  if (!response.ok) {
+    throw new Error(`trace.moe request failed: ${response.status}`);
+  }
+  return response.json();
+}
+
+export async function searchByBase64(base64Image: string): Promise<TraceMoeResponse> {
+  const response = await fetch(`${BASE_URL}/search`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      ...getHeaders(),
+    },
+    body: JSON.stringify({ image: base64Image, cutBorders: true }),
+  });
+  if (!response.ok) {
+    const body = await response.text().catch(() => "");
+    throw new Error(`trace.moe request failed: ${response.status} — ${body}`);
+  }
+  return response.json();
+}
+
+/**
+ * Send image bytes as multipart/form-data.
+ * More reliable than base64 JSON when the MIME type is unknown or large.
+ */
+export async function searchByBuffer(
+  buffer: ArrayBuffer,
+  mimeType: string
+): Promise<TraceMoeResponse> {
+  const form = new FormData();
+  form.append("image", new Blob([buffer], { type: mimeType }), "frame.jpg");
+
+  const response = await fetch(`${BASE_URL}/search?cutBorders=true`, {
+    method: "POST",
+    headers: getHeaders(), // no Content-Type — let fetch set the multipart boundary
+    body: form,
+  });
+  if (!response.ok) {
+    const body = await response.text().catch(() => "");
+    throw new Error(`trace.moe request failed: ${response.status} — ${body}`);
+  }
+  return response.json();
+}

@@ -1,65 +1,399 @@
-import Image from "next/image";
+"use client";
+
+import { useState, useEffect, useCallback } from "react";
+import SearchBar from "./components/SearchBar";
+import ProgressBar from "./components/ProgressBar";
+import ResultCard from "./components/ResultCard";
+import MalLoginButton from "./components/MalLoginButton";
+import Toast from "./components/Toast";
+import type { AnimeResult } from "@/types";
+
+type Phase = "idle" | "searching" | "results" | "error";
+
+const PROGRESS_STEPS = [
+  { pct: 15, label: "Validating TikTok URL..." },
+  { pct: 30, label: "Fetching video from TikWM..." },
+  { pct: 50, label: "Extracting key frames..." },
+  { pct: 70, label: "Searching trace.moe database..." },
+  { pct: 85, label: "Fetching anime details from MAL..." },
+  { pct: 95, label: "Processing results..." },
+];
 
 export default function Home() {
+  const [url, setUrl] = useState("");
+  const [phase, setPhase] = useState<Phase>("idle");
+  const [progress, setProgress] = useState(0);
+  const [progressLabel, setProgressLabel] = useState("");
+  const [results, setResults] = useState<AnimeResult[]>([]);
+  const [debugImages, setDebugImages] = useState<string[]>([]);
+  const [error, setError] = useState<string | null>(null);
+  const [isLoggedIn, setIsLoggedIn] = useState(false);
+  const [expandedIdx, setExpandedIdx] = useState<number | null>(null);
+  const [toast, setToast] = useState<string | null>(null);
+
+  const showToast = useCallback((msg: string) => {
+    setToast(msg);
+    setTimeout(() => setToast(null), 3000);
+  }, []);
+
+  // Check login state and handle OAuth redirects on mount
+  useEffect(() => {
+    fetch("/api/me")
+      .then((r) => r.json())
+      .then((data) => setIsLoggedIn(data.loggedIn))
+      .catch(() => {});
+
+    const params = new URLSearchParams(window.location.search);
+    if (params.get("login") === "success") {
+      setIsLoggedIn(true);
+      showToast("Connected to MyAnimeList!");
+      window.history.replaceState({}, "", "/");
+    } else if (params.get("error")) {
+      showToast("Failed to connect to MyAnimeList. Please try again.");
+      window.history.replaceState({}, "", "/");
+    }
+  }, [showToast]);
+
+  const handleLogout = useCallback(async () => {
+    await fetch("/api/auth/mal/logout", { method: "POST" });
+    setIsLoggedIn(false);
+    showToast("Logged out from MyAnimeList");
+  }, [showToast]);
+
+  const handleSearch = useCallback(async () => {
+    if (!url.trim() || phase === "searching") return;
+
+    setPhase("searching");
+    setProgress(0);
+    setResults([]);
+    setDebugImages([]);
+    setError(null);
+    setExpandedIdx(null);
+
+    // Animate progress while the real request runs in parallel
+    let stepIdx = 0;
+    const stepInterval = setInterval(() => {
+      if (stepIdx < PROGRESS_STEPS.length) {
+        setProgress(PROGRESS_STEPS[stepIdx].pct);
+        setProgressLabel(PROGRESS_STEPS[stepIdx].label);
+        stepIdx++;
+      } else {
+        setProgress(95);
+        setProgressLabel("Almost done...");
+        clearInterval(stepInterval);
+      }
+    }, 900);
+
+    try {
+      const response = await fetch("/api/identify", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ url: url.trim() }),
+      });
+
+      clearInterval(stepInterval);
+      setProgress(100);
+      setProgressLabel("Done!");
+
+      const data = await response.json();
+
+      setTimeout(() => {
+        if (data.debugImages?.length) setDebugImages(data.debugImages);
+        if (data.success && data.results.length > 0) {
+          setResults(data.results);
+          setPhase("results");
+          setExpandedIdx(0);
+        } else {
+          setError(
+            data.error ||
+              "No results found. Try a different video or upload a screenshot."
+          );
+          setPhase("error");
+        }
+      }, 400);
+    } catch {
+      clearInterval(stepInterval);
+      setError("Network error. Please check your connection and try again.");
+      setPhase("error");
+    }
+  }, [url, phase]);
+
+  const handleAddToList = useCallback(
+    async (malId: number, title: string) => {
+      try {
+        const response = await fetch("/api/watchlist", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ malId }),
+        });
+        if (response.ok) {
+          showToast(`"${title}" added to your plan to watch list!`);
+        } else if (response.status === 401) {
+          showToast("Please log in with MyAnimeList first.");
+        } else {
+          showToast("Failed to add to watchlist. Please try again.");
+        }
+      } catch {
+        showToast("Failed to add to watchlist. Please try again.");
+      }
+    },
+    [showToast]
+  );
+
   return (
-    <div className="flex flex-col flex-1 items-center justify-center bg-zinc-50 font-sans dark:bg-black">
-      <main className="flex flex-1 w-full max-w-3xl flex-col items-center justify-between py-32 px-16 bg-white dark:bg-black sm:items-start">
-        <Image
-          className="dark:invert"
-          src="/next.svg"
-          alt="Next.js logo"
-          width={100}
-          height={20}
-          priority
-        />
-        <div className="flex flex-col items-center gap-6 text-center sm:items-start sm:text-left">
-          <h1 className="max-w-xs text-3xl font-semibold leading-10 tracking-tight text-black dark:text-zinc-50">
-            To get started, edit the page.tsx file.
+    <div
+      style={{
+        fontFamily: "var(--font-geist-sans), sans-serif",
+        maxWidth: "640px",
+        margin: "0 auto",
+        padding: "40px 16px 80px",
+      }}
+    >
+      {/* Header */}
+      <div style={{ textAlign: "center", marginBottom: "32px" }}>
+        <div
+          style={{
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            gap: "10px",
+            marginBottom: "6px",
+          }}
+        >
+          <svg width="32" height="32" viewBox="0 0 48 48" fill="none">
+            <rect width="48" height="48" rx="12" fill="url(#hg)" />
+            <defs>
+              <linearGradient id="hg" x1="0" y1="0" x2="48" y2="48">
+                <stop stopColor="#6366f1" />
+                <stop offset="1" stopColor="#a855f7" />
+              </linearGradient>
+            </defs>
+            <path
+              d="M14 16l8 8-8 8M24 32h10"
+              stroke="#fff"
+              strokeWidth="2.5"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+            />
+          </svg>
+          <h1
+            style={{
+              margin: 0,
+              fontSize: "24px",
+              fontWeight: 700,
+              color: "var(--color-text-primary)",
+              letterSpacing: "-0.5px",
+            }}
+          >
+            AniTrace
           </h1>
-          <p className="max-w-md text-lg leading-8 text-zinc-600 dark:text-zinc-400">
-            Looking for a starting point or more instructions? Head over to{" "}
-            <a
-              href="https://vercel.com/templates?framework=next.js&utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
+        </div>
+        <p
+          style={{
+            margin: 0,
+            fontSize: "14px",
+            color: "var(--color-text-secondary)",
+          }}
+        >
+          Paste a TikTok link, find the anime
+        </p>
+      </div>
+
+      {/* MAL Login */}
+      <MalLoginButton isLoggedIn={isLoggedIn} onLogout={handleLogout} />
+
+      {/* Search input */}
+      <SearchBar
+        url={url}
+        onChange={setUrl}
+        onSearch={handleSearch}
+        isSearching={phase === "searching"}
+      />
+
+      {/* Progress */}
+      {phase === "searching" && (
+        <ProgressBar progress={progress} label={progressLabel} />
+      )}
+
+      {/* Debug image strip — only shown in development when debugImages are present */}
+      {debugImages.length > 0 && (
+        <details style={{ marginTop: "24px" }}>
+          <summary
+            style={{
+              cursor: "pointer",
+              fontSize: "12px",
+              color: "var(--color-text-tertiary)",
+              userSelect: "none",
+              marginBottom: "8px",
+            }}
+          >
+            🔍 Debug — {debugImages.length} image{debugImages.length !== 1 ? "s" : ""} sent to trace.moe
+          </summary>
+          <div style={{ display: "flex", gap: "8px", flexWrap: "wrap" }}>
+            {debugImages.map((src, i) => (
+              // eslint-disable-next-line @next/next/no-img-element
+              <img
+                key={i}
+                src={src}
+                alt={`Frame ${i + 1}`}
+                style={{
+                  height: "120px",
+                  borderRadius: "8px",
+                  border: "1px solid var(--color-border-tertiary)",
+                  objectFit: "cover",
+                }}
+              />
+            ))}
+          </div>
+        </details>
+      )}
+
+      {/* Error state */}
+      {phase === "error" && error && (
+        <div
+          style={{
+            marginTop: "24px",
+            padding: "16px",
+            borderRadius: "12px",
+            background: "var(--color-background-warning)",
+            color: "var(--color-text-warning)",
+            fontSize: "14px",
+            lineHeight: 1.5,
+          }}
+        >
+          {error}
+          <div style={{ marginTop: "12px" }}>
+            <button
+              onClick={() => {
+                setPhase("idle");
+                setError(null);
+              }}
+              style={{
+                padding: "6px 14px",
+                borderRadius: "8px",
+                background: "var(--color-background-secondary)",
+                color: "var(--color-text-secondary)",
+                fontSize: "12px",
+                fontWeight: 500,
+                border: "1px solid var(--color-border-tertiary)",
+                cursor: "pointer",
+              }}
             >
-              Templates
-            </a>{" "}
-            or the{" "}
-            <a
-              href="https://nextjs.org/learn?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
+              Try again
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* Results */}
+      {phase === "results" && results.length > 0 && (
+        <div style={{ marginTop: "24px" }}>
+          <div
+            style={{
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "space-between",
+              marginBottom: "12px",
+            }}
+          >
+            <h2
+              style={{
+                margin: 0,
+                fontSize: "16px",
+                fontWeight: 600,
+                color: "var(--color-text-primary)",
+              }}
             >
-              Learning
-            </a>{" "}
-            center.
+              Results
+            </h2>
+            <span
+              style={{ fontSize: "12px", color: "var(--color-text-tertiary)" }}
+            >
+              {results.length} match{results.length !== 1 ? "es" : ""} found
+            </span>
+          </div>
+
+          <div
+            style={{ display: "flex", flexDirection: "column", gap: "12px" }}
+          >
+            {results.map((anime, i) => (
+              <ResultCard
+                key={anime.malId}
+                anime={anime}
+                isLoggedIn={isLoggedIn}
+                onAddToList={handleAddToList}
+                expanded={expandedIdx === i}
+                onToggle={() =>
+                  setExpandedIdx(expandedIdx === i ? null : i)
+                }
+              />
+            ))}
+          </div>
+
+          <div
+            style={{
+              marginTop: "20px",
+              padding: "14px 16px",
+              background: "var(--color-background-secondary)",
+              borderRadius: "12px",
+              fontSize: "12px",
+              color: "var(--color-text-tertiary)",
+              lineHeight: 1.6,
+            }}
+          >
+            <strong style={{ color: "var(--color-text-secondary)" }}>
+              How it works:
+            </strong>{" "}
+            AniTrace downloads the TikTok video, extracts keyframes, and sends
+            them to trace.moe&apos;s anime scene database. The best match is
+            then looked up on MyAnimeList for full details.
+          </div>
+        </div>
+      )}
+
+      {/* Idle empty state */}
+      {phase === "idle" && (
+        <div
+          style={{
+            textAlign: "center",
+            marginTop: "48px",
+            color: "var(--color-text-tertiary)",
+          }}
+        >
+          <svg
+            width="48"
+            height="48"
+            viewBox="0 0 48 48"
+            fill="none"
+            style={{ opacity: 0.4, marginBottom: "12px" }}
+          >
+            <circle
+              cx="22"
+              cy="22"
+              r="14"
+              stroke="currentColor"
+              strokeWidth="2"
+            />
+            <line
+              x1="32"
+              y1="32"
+              x2="42"
+              y2="42"
+              stroke="currentColor"
+              strokeWidth="2"
+              strokeLinecap="round"
+            />
+          </svg>
+          <p style={{ margin: 0, fontSize: "14px" }}>
+            Paste a TikTok URL above to identify the anime
+          </p>
+          <p style={{ margin: "4px 0 0", fontSize: "12px", opacity: 0.7 }}>
+            Works with anime clips, edits, AMVs, and scene compilations
           </p>
         </div>
-        <div className="flex flex-col gap-4 text-base font-medium sm:flex-row">
-          <a
-            className="flex h-12 w-full items-center justify-center gap-2 rounded-full bg-foreground px-5 text-background transition-colors hover:bg-[#383838] dark:hover:bg-[#ccc] md:w-[158px]"
-            href="https://vercel.com/new?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            <Image
-              className="dark:invert"
-              src="/vercel.svg"
-              alt="Vercel logomark"
-              width={16}
-              height={16}
-            />
-            Deploy Now
-          </a>
-          <a
-            className="flex h-12 w-full items-center justify-center rounded-full border border-solid border-black/[.08] px-5 transition-colors hover:border-transparent hover:bg-black/[.04] dark:border-white/[.145] dark:hover:bg-[#1a1a1a] md:w-[158px]"
-            href="https://nextjs.org/docs?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            Documentation
-          </a>
-        </div>
-      </main>
+      )}
+
+      <Toast message={toast} />
     </div>
   );
 }
