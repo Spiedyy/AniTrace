@@ -1,5 +1,8 @@
 "use client";
 
+import { useEffect, useRef } from "react";
+import { motion, AnimatePresence } from "motion/react";
+
 interface SearchBarProps {
   url: string;
   onChange: (value: string) => void;
@@ -15,12 +18,35 @@ export default function SearchBar({
   onSearch,
   isSearching,
 }: SearchBarProps) {
+  const inputRef = useRef<HTMLInputElement | null>(null);
   const isEmpty = !url.trim();
   const isInvalid = !isEmpty && !TIKTOK_URL_REGEX.test(url.trim());
+  const isDisabled = isSearching || isEmpty;
+
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (!(event.ctrlKey || event.metaKey) || event.key.toLowerCase() !== "k") return;
+
+      const target = event.target as HTMLElement | null;
+      const isTypingContext =
+        target?.tagName === "INPUT" ||
+        target?.tagName === "TEXTAREA" ||
+        target?.isContentEditable;
+
+      if (isTypingContext && target !== inputRef.current) return;
+
+      event.preventDefault();
+      inputRef.current?.focus();
+      inputRef.current?.select();
+    };
+
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, []);
 
   return (
     <div>
-      <div
+      <motion.div
         style={{
           display: "flex",
           gap: "8px",
@@ -28,10 +54,12 @@ export default function SearchBar({
           border: "1px solid var(--color-border-tertiary)",
           borderRadius: "14px",
           padding: "6px",
-          transition: "border-color 0.2s",
         }}
+        whileFocus={{ borderColor: "var(--color-border-secondary)" }}
+        transition={{ duration: 0.2 }}
       >
         <input
+          ref={inputRef}
           type="text"
           value={url}
           onChange={(e) => onChange(e.target.value)}
@@ -50,40 +78,44 @@ export default function SearchBar({
             borderRadius: "10px",
           }}
         />
-        <button
+        <motion.button
           onClick={onSearch}
-          disabled={isSearching || isEmpty}
+          disabled={isDisabled}
+          whileHover={isDisabled ? {} : { scale: 1.03 }}
+          whileTap={isDisabled ? {} : { scale: 0.97 }}
+          transition={{ type: "spring", stiffness: 400, damping: 25 }}
           style={{
             padding: "10px 20px",
             borderRadius: "10px",
-            background:
-              isEmpty || isSearching
-                ? "var(--color-background-secondary)"
-                : "#6366f1",
-            color:
-              isEmpty || isSearching ? "var(--color-text-tertiary)" : "#fff",
+            background: isDisabled ? "var(--color-background-secondary)" : "#6366f1",
+            color: isDisabled ? "var(--color-text-tertiary)" : "#fff",
             fontSize: "14px",
             fontWeight: 600,
             border: "none",
-            cursor: isEmpty || isSearching ? "not-allowed" : "pointer",
-            transition: "all 0.15s",
+            cursor: isDisabled ? "not-allowed" : "pointer",
             whiteSpace: "nowrap",
           }}
         >
           {isSearching ? "Searching..." : "Find anime"}
-        </button>
-      </div>
-      {isInvalid && (
-        <p
-          style={{
-            margin: "8px 0 0 6px",
-            fontSize: "12px",
-            color: "var(--color-text-warning)",
-          }}
-        >
-          Enter a valid TikTok video URL (e.g. https://www.tiktok.com/@user/video/123)
-        </p>
-      )}
+        </motion.button>
+      </motion.div>
+      <AnimatePresence>
+        {isInvalid && (
+          <motion.p
+            initial={{ opacity: 0, y: -4 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: -4 }}
+            transition={{ duration: 0.15 }}
+            style={{
+              margin: "8px 0 0 6px",
+              fontSize: "12px",
+              color: "var(--color-text-warning)",
+            }}
+          >
+            Enter a valid TikTok video URL (e.g. https://www.tiktok.com/@user/video/123)
+          </motion.p>
+        )}
+      </AnimatePresence>
     </div>
   );
 }

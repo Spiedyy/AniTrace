@@ -1,8 +1,8 @@
 import { NextResponse } from "next/server";
+import { clearAuthCookies } from "@/lib/mal-auth";
 
 export async function POST() {
   const response = NextResponse.json({ success: true });
-  response.cookies.delete("mal_access_token");
-  response.cookies.delete("mal_refresh_token");
+  clearAuthCookies(response);
   return response;
 }

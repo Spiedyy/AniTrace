@@ -20,13 +20,14 @@ export async function searchByImageUrl(imageUrl: string): Promise<TraceMoeRespon
 }
 
 export async function searchByBase64(base64Image: string): Promise<TraceMoeResponse> {
-  const response = await fetch(`${BASE_URL}/search`, {
+  // cutBorders must be a URL query parameter — the JSON body only accepts `image`.
+  const response = await fetch(`${BASE_URL}/search?cutBorders=true`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
       ...getHeaders(),
     },
-    body: JSON.stringify({ image: base64Image, cutBorders: true }),
+    body: JSON.stringify({ image: base64Image }),
   });
   if (!response.ok) {
     const body = await response.text().catch(() => "");

@@ -1,6 +1,7 @@
 "use client";
 
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
+import { motion, AnimatePresence } from "motion/react";
 import SearchBar from "./components/SearchBar";
 import ProgressBar from "./components/ProgressBar";
 import ResultCard from "./components/ResultCard";
@@ -9,6 +10,7 @@ import Toast from "./components/Toast";
 import type { AnimeResult } from "@/types";
 
 type Phase = "idle" | "searching" | "results" | "error";
+type WatchlistActionState = "idle" | "saving" | "added" | "already_completed";
 
 const PROGRESS_STEPS = [
   { pct: 15, label: "Validating TikTok URL..." },
@@ -25,11 +27,15 @@ export default function Home() {
   const [progress, setProgress] = useState(0);
   const [progressLabel, setProgressLabel] = useState("");
   const [results, setResults] = useState<AnimeResult[]>([]);
+  const [dismissedMalIds, setDismissedMalIds] = useState<Set<number>>(new Set());
   const [debugImages, setDebugImages] = useState<string[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [isLoggedIn, setIsLoggedIn] = useState(false);
   const [expandedIdx, setExpandedIdx] = useState<number | null>(null);
   const [toast, setToast] = useState<string | null>(null);
+  const [watchlistStateByMalId, setWatchlistStateByMalId] = useState<Record<number, WatchlistActionState>>({});
+  const pendingUpdateRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const activeSearchIdRef = useRef(0);
 
   const showToast = useCallback((msg: string) => {
     setToast(msg);
@@ -60,12 +66,19 @@ export default function Home() {
     showToast("Logged out from MyAnimeList");
   }, [showToast]);
 
-  const handleSearch = useCallback(async () => {
-    if (!url.trim() || phase === "searching") return;
+  const runSearch = useCallback(async (searchUrl: string, excludeIds: number[] = []) => {
+    activeSearchIdRef.current += 1;
+    const searchId = activeSearchIdRef.current;
 
+    // Cancel any delayed state update still pending from a previous search.
+    // Without this, a stale setTimeout can fire mid-search, showing an old toast
+    // or resetting phase back to "results" while the new request is still in flight.
+    if (pendingUpdateRef.current !== null) {
+      clearTimeout(pendingUpdateRef.current);
+      pendingUpdateRef.current = null;
+    }
     setPhase("searching");
     setProgress(0);
-    setResults([]);
     setDebugImages([]);
     setError(null);
     setExpandedIdx(null);
@@ -85,11 +98,19 @@ export default function Home() {
     }, 900);
 
     try {
+      const body: Record<string, unknown> = { url: searchUrl };
+      if (excludeIds.length > 0) body.excludeMalIds = excludeIds;
+
       const response = await fetch("/api/identify", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ url: url.trim() }),
+        body: JSON.stringify(body),
       });
+
+      if (searchId !== activeSearchIdRef.current) {
+        clearInterval(stepInterval);
+        return;
+      }
 
       clearInterval(stepInterval);
       setProgress(100);
@@ -97,47 +118,92 @@ export default function Home() {
 
       const data = await response.json();
 
-      setTimeout(() => {
+      pendingUpdateRef.current = setTimeout(() => {
+        if (searchId !== activeSearchIdRef.current) return;
+        pendingUpdateRef.current = null;
         if (data.debugImages?.length) setDebugImages(data.debugImages);
         if (data.success && data.results.length > 0) {
-          setResults(data.results);
+          // Merge new results with existing ones, avoiding duplicates
+          setResults((prev) => {
+            const existing = new Set(prev.map((r) => r.malId));
+            const merged = [...prev, ...data.results.filter((r: AnimeResult) => !existing.has(r.malId))];
+            return merged;
+          });
           setPhase("results");
-          setExpandedIdx(0);
+          setExpandedIdx(excludeIds.length > 0 ? null : 0);
         } else {
-          setError(
-            data.error ||
-              "No results found. Try a different video or upload a screenshot."
-          );
-          setPhase("error");
+          if (excludeIds.length > 0) {
+            // Retry with exclusions found nothing new — stay in results phase
+            setPhase("results");
+            showToast(data.error || "No additional matches found.");
+          } else {
+            setError(
+              data.error ||
+                "No results found. Try a different video or upload a screenshot."
+            );
+            setPhase("error");
+          }
         }
       }, 400);
     } catch {
+      if (searchId !== activeSearchIdRef.current) {
+        clearInterval(stepInterval);
+        return;
+      }
       clearInterval(stepInterval);
       setError("Network error. Please check your connection and try again.");
       setPhase("error");
     }
-  }, [url, phase]);
+  }, [showToast]);
+
+  const handleSearch = useCallback(async () => {
+    if (!url.trim() || phase === "searching") return;
+    setResults([]);
+    setDismissedMalIds(new Set());
+    setWatchlistStateByMalId({});
+    await runSearch(url.trim());
+  }, [url, phase, runSearch]);
+
+  const handleMarkIncorrect = useCallback((malId: number) => {
+    setDismissedMalIds((prev) => new Set([...prev, malId]));
+  }, []);
+
+  const handleRetry = useCallback(() => {
+    runSearch(url.trim(), [...dismissedMalIds]);
+  }, [url, runSearch, dismissedMalIds]);
 
   const handleAddToList = useCallback(
     async (malId: number, title: string) => {
+      if (watchlistStateByMalId[malId] === "saving") return;
+      setWatchlistStateByMalId((prev) => ({ ...prev, [malId]: "saving" }));
       try {
         const response = await fetch("/api/watchlist", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ malId }),
         });
+        const data = await response.json().catch(() => null);
         if (response.ok) {
-          showToast(`"${title}" added to your plan to watch list!`);
+          if (data?.skipped && data?.reason === "already_completed") {
+            setWatchlistStateByMalId((prev) => ({ ...prev, [malId]: "already_completed" }));
+            showToast(`"${title}" is already completed on your MAL list.`);
+          } else {
+            setWatchlistStateByMalId((prev) => ({ ...prev, [malId]: "added" }));
+            showToast(`"${title}" added to your plan to watch list!`);
+          }
         } else if (response.status === 401) {
+          setWatchlistStateByMalId((prev) => ({ ...prev, [malId]: "idle" }));
           showToast("Please log in with MyAnimeList first.");
         } else {
+          setWatchlistStateByMalId((prev) => ({ ...prev, [malId]: "idle" }));
           showToast("Failed to add to watchlist. Please try again.");
         }
       } catch {
+        setWatchlistStateByMalId((prev) => ({ ...prev, [malId]: "idle" }));
         showToast("Failed to add to watchlist. Please try again.");
       }
     },
-    [showToast]
+    [showToast, watchlistStateByMalId]
   );
 
   return (
@@ -200,7 +266,14 @@ export default function Home() {
       </div>
 
       {/* MAL Login */}
-      <MalLoginButton isLoggedIn={isLoggedIn} onLogout={handleLogout} />
+      <MalLoginButton
+        isLoggedIn={isLoggedIn}
+        onLogout={handleLogout}
+        onLoginSuccess={() => {
+          setIsLoggedIn(true);
+          showToast("Connected to MyAnimeList!");
+        }}
+      />
 
       {/* Search input */}
       <SearchBar
@@ -249,107 +322,151 @@ export default function Home() {
       )}
 
       {/* Error state */}
-      {phase === "error" && error && (
-        <div
-          style={{
-            marginTop: "24px",
-            padding: "16px",
-            borderRadius: "12px",
-            background: "var(--color-background-warning)",
-            color: "var(--color-text-warning)",
-            fontSize: "14px",
-            lineHeight: 1.5,
-          }}
-        >
-          {error}
-          <div style={{ marginTop: "12px" }}>
-            <button
-              onClick={() => {
-                setPhase("idle");
-                setError(null);
-              }}
-              style={{
-                padding: "6px 14px",
-                borderRadius: "8px",
-                background: "var(--color-background-secondary)",
-                color: "var(--color-text-secondary)",
-                fontSize: "12px",
-                fontWeight: 500,
-                border: "1px solid var(--color-border-tertiary)",
-                cursor: "pointer",
-              }}
-            >
-              Try again
-            </button>
-          </div>
-        </div>
-      )}
+      <AnimatePresence>
+        {phase === "error" && error && (
+          <motion.div
+            initial={{ opacity: 0, y: 8 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: -8 }}
+            transition={{ duration: 0.2 }}
+            style={{
+              marginTop: "24px",
+              padding: "16px",
+              borderRadius: "12px",
+              background: "var(--color-background-warning)",
+              color: "var(--color-text-warning)",
+              fontSize: "14px",
+              lineHeight: 1.5,
+            }}
+          >
+            {error}
+            <div style={{ marginTop: "12px" }}>
+              <motion.button
+                onClick={() => {
+                  setPhase("idle");
+                  setError(null);
+                }}
+                whileHover={{ scale: 1.03 }}
+                whileTap={{ scale: 0.97 }}
+                style={{
+                  padding: "6px 14px",
+                  borderRadius: "8px",
+                  background: "var(--color-background-secondary)",
+                  color: "var(--color-text-secondary)",
+                  fontSize: "12px",
+                  fontWeight: 500,
+                  border: "1px solid var(--color-border-tertiary)",
+                  cursor: "pointer",
+                }}
+              >
+                Try again
+              </motion.button>
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
 
       {/* Results */}
-      {phase === "results" && results.length > 0 && (
-        <div style={{ marginTop: "24px" }}>
-          <div
-            style={{
-              display: "flex",
-              alignItems: "center",
-              justifyContent: "space-between",
-              marginBottom: "12px",
-            }}
-          >
-            <h2
+      {phase === "results" && results.length > 0 && (() => {
+        const visibleResults = results.filter((r) => !dismissedMalIds.has(r.malId));
+        const allDismissed = visibleResults.length === 0;
+        return (
+          <div style={{ marginTop: "24px" }}>
+            <div
               style={{
-                margin: 0,
-                fontSize: "16px",
-                fontWeight: 600,
-                color: "var(--color-text-primary)",
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "space-between",
+                marginBottom: "12px",
               }}
             >
-              Results
-            </h2>
-            <span
-              style={{ fontSize: "12px", color: "var(--color-text-tertiary)" }}
+              <h2
+                style={{
+                  margin: 0,
+                  fontSize: "16px",
+                  fontWeight: 600,
+                  color: "var(--color-text-primary)",
+                }}
+              >
+                Results
+              </h2>
+              <span
+                style={{ fontSize: "12px", color: "var(--color-text-tertiary)" }}
+              >
+                {visibleResults.length} match{visibleResults.length !== 1 ? "es" : ""} found
+              </span>
+            </div>
+
+            {allDismissed ? (
+              <div
+                style={{
+                  padding: "24px 16px",
+                  borderRadius: "12px",
+                  background: "var(--color-background-secondary)",
+                  textAlign: "center",
+                }}
+              >
+                <p style={{ margin: "0 0 12px", fontSize: "14px", color: "var(--color-text-secondary)" }}>
+                  None of these matched? Let us try other identification methods.
+                </p>
+                <button
+                  onClick={handleRetry}
+                  style={{
+                    padding: "10px 20px",
+                    borderRadius: "10px",
+                    background: "var(--color-text-primary)",
+                    color: "var(--color-background-primary)",
+                    fontSize: "13px",
+                    fontWeight: 500,
+                    border: "none",
+                    cursor: "pointer",
+                  }}
+                >
+                  Try other methods
+                </button>
+              </div>
+            ) : (
+              <div
+                style={{ display: "flex", flexDirection: "column", gap: "12px" }}
+              >
+                {visibleResults.map((anime, i) => (
+                  <ResultCard
+                    key={anime.malId}
+                    anime={anime}
+                    isLoggedIn={isLoggedIn}
+                    onAddToList={handleAddToList}
+                    watchlistActionState={watchlistStateByMalId[anime.malId] ?? "idle"}
+                    onMarkIncorrect={handleMarkIncorrect}
+                    expanded={expandedIdx === i}
+                    onToggle={() =>
+                      setExpandedIdx(expandedIdx === i ? null : i)
+                    }
+                  />
+                ))}
+              </div>
+            )}
+
+            <div
+              style={{
+                marginTop: "20px",
+                padding: "14px 16px",
+                background: "var(--color-background-secondary)",
+                borderRadius: "12px",
+                fontSize: "12px",
+                color: "var(--color-text-tertiary)",
+                lineHeight: 1.6,
+              }}
             >
-              {results.length} match{results.length !== 1 ? "es" : ""} found
-            </span>
+              <strong style={{ color: "var(--color-text-secondary)" }}>
+                How it works:
+              </strong>{" "}
+              AniTrace downloads the TikTok video, extracts keyframes, and sends
+              them to trace.moe&apos;s anime scene database. The best match is
+              then looked up on MyAnimeList for full details.
+            </div>
           </div>
-
-          <div
-            style={{ display: "flex", flexDirection: "column", gap: "12px" }}
-          >
-            {results.map((anime, i) => (
-              <ResultCard
-                key={anime.malId}
-                anime={anime}
-                isLoggedIn={isLoggedIn}
-                onAddToList={handleAddToList}
-                expanded={expandedIdx === i}
-                onToggle={() =>
-                  setExpandedIdx(expandedIdx === i ? null : i)
-                }
-              />
-            ))}
-          </div>
-
-          <div
-            style={{
-              marginTop: "20px",
-              padding: "14px 16px",
-              background: "var(--color-background-secondary)",
-              borderRadius: "12px",
-              fontSize: "12px",
-              color: "var(--color-text-tertiary)",
-              lineHeight: 1.6,
-            }}
-          >
-            <strong style={{ color: "var(--color-text-secondary)" }}>
-              How it works:
-            </strong>{" "}
-            AniTrace downloads the TikTok video, extracts keyframes, and sends
-            them to trace.moe&apos;s anime scene database. The best match is
-            then looked up on MyAnimeList for full details.
-          </div>
-        </div>
-      )}
+        );
+      })()}
 
       {/* Idle empty state */}
       {phase === "idle" && (

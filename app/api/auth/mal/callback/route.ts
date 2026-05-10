@@ -1,63 +1,55 @@
 import { NextRequest, NextResponse } from "next/server";
+import {
+  COOKIE_PKCE, COOKIE_POPUP,
+  exchangeCode, setTokenCookies, clearAuthCookies, popupClosePage,
+} from "@/lib/mal-auth";
 
 export async function GET(request: NextRequest) {
-  const code = request.nextUrl.searchParams.get("code");
-  const codeVerifier = request.cookies.get("mal_code_verifier")?.value;
+  const { searchParams, origin } = request.nextUrl;
+  const code = searchParams.get("code");
+  const returnedState = searchParams.get("state");
+  const oauthError = searchParams.get("error");
 
-  if (!code || !codeVerifier) {
-    return NextResponse.redirect(
-      new URL("/?error=auth_failed", request.url)
-    );
+  const pkceRaw = request.cookies.get(COOKIE_PKCE)?.value;
+  const isPopup = request.cookies.get(COOKIE_POPUP)?.value === "1";
+
+  function fail(reason: string): NextResponse {
+    console.error("[mal/callback] Auth failed:", reason);
+    if (isPopup) return popupClosePage(false);
+    return NextResponse.redirect(new URL(`/?error=${encodeURIComponent(reason)}`, origin));
   }
 
+  // User denied access on MAL's page
+  if (oauthError) return fail(oauthError);
+
+  // Missing required values
+  if (!code || !pkceRaw) return fail("missing_params");
+
+  // Parse the stored PKCE blob
+  let pkce: { verifier: string; state: string };
   try {
-    const tokenRes = await fetch("https://myanimelist.net/v1/oauth2/token", {
-      method: "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body: new URLSearchParams({
-        client_id: process.env.MAL_CLIENT_ID!,
-        client_secret: process.env.MAL_CLIENT_SECRET!,
-        grant_type: "authorization_code",
-        code,
-        code_verifier: codeVerifier,
-        redirect_uri: process.env.MAL_REDIRECT_URI!,
-      }),
-    });
-
-    if (!tokenRes.ok) {
-      return NextResponse.redirect(
-        new URL("/?error=token_exchange_failed", request.url)
-      );
-    }
-
-    const tokens = await tokenRes.json();
-
-    const response = NextResponse.redirect(
-      new URL("/?login=success", request.url)
-    );
-
-    response.cookies.set("mal_access_token", tokens.access_token, {
-      httpOnly: true,
-      secure: process.env.NODE_ENV === "production",
-      sameSite: "lax",
-      maxAge: tokens.expires_in,
-      path: "/",
-    });
-
-    response.cookies.set("mal_refresh_token", tokens.refresh_token, {
-      httpOnly: true,
-      secure: process.env.NODE_ENV === "production",
-      sameSite: "lax",
-      maxAge: 60 * 60 * 24 * 30, // 30 days
-      path: "/",
-    });
-
-    response.cookies.delete("mal_code_verifier");
-
-    return response;
+    pkce = JSON.parse(pkceRaw);
   } catch {
-    return NextResponse.redirect(
-      new URL("/?error=auth_failed", request.url)
-    );
+    return fail("invalid_session");
   }
+
+  // Validate state — prevents CSRF
+  if (!returnedState || returnedState !== pkce.state) return fail("state_mismatch");
+
+  // Exchange authorization code for access + refresh tokens
+  const tokens = await exchangeCode(code, pkce.verifier);
+  if (!tokens) return fail("token_exchange_failed");
+
+  if (isPopup) {
+    const response = popupClosePage(true);
+    setTokenCookies(response, tokens);
+    response.cookies.delete(COOKIE_PKCE);
+    response.cookies.delete(COOKIE_POPUP);
+    return response;
+  }
+
+  const response = NextResponse.redirect(new URL("/?login=success", origin));
+  setTokenCookies(response, tokens);
+  response.cookies.delete(COOKIE_PKCE);
+  return response;
 }

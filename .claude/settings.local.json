@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npx tsc *)",
+      "Bash(pnpm add *)",
+      "Bash(Test-Path \"C:\\\\Users\\\\damia\\\\Documents\\\\Projects\\\\AniTrace\\\\node_modules\\\\.pnpm\\\\ffmpeg-static@5.3.0\\\\node_modules\\\\ffmpeg-static\\\\ffmpeg.exe\")",
+      "WebFetch(domain:myanimelist.net)"
+    ]
+  }
+}
