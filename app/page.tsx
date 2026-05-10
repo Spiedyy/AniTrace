@@ -226,21 +226,25 @@ export default function Home() {
             marginBottom: "6px",
           }}
         >
-          <svg width="32" height="32" viewBox="0 0 48 48" fill="none">
-            <rect width="48" height="48" rx="12" fill="url(#hg)" />
+          <svg width="36" height="36" viewBox="0 0 48 48" fill="none">
             <defs>
-              <linearGradient id="hg" x1="0" y1="0" x2="48" y2="48">
+              <linearGradient id="hg" x1="0" y1="0" x2="48" y2="48" gradientUnits="userSpaceOnUse">
                 <stop stopColor="#6366f1" />
                 <stop offset="1" stopColor="#a855f7" />
               </linearGradient>
             </defs>
-            <path
-              d="M14 16l8 8-8 8M24 32h10"
-              stroke="#fff"
-              strokeWidth="2.5"
-              strokeLinecap="round"
-              strokeLinejoin="round"
-            />
+            <rect width="48" height="48" rx="12" fill="url(#hg)" />
+            {/* Outer ring */}
+            <circle cx="24" cy="24" r="16" stroke="white" strokeOpacity="0.22" strokeWidth="1.5" fill="none" />
+            {/* Inner lens ring */}
+            <circle cx="24" cy="24" r="10.5" stroke="white" strokeOpacity="0.65" strokeWidth="1.5" fill="none" />
+            {/* Crosshair ticks */}
+            <line x1="24" y1="5" x2="24" y2="10" stroke="white" strokeOpacity="0.65" strokeWidth="2" strokeLinecap="round" />
+            <line x1="24" y1="38" x2="24" y2="43" stroke="white" strokeOpacity="0.65" strokeWidth="2" strokeLinecap="round" />
+            <line x1="5" y1="24" x2="10" y2="24" stroke="white" strokeOpacity="0.65" strokeWidth="2" strokeLinecap="round" />
+            <line x1="38" y1="24" x2="43" y2="24" stroke="white" strokeOpacity="0.65" strokeWidth="2" strokeLinecap="round" />
+            {/* Play triangle */}
+            <polygon points="21,18 21,30 32,24" fill="white" />
           </svg>
           <h1
             style={{
