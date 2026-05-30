@@ -13,8 +13,7 @@ import {
 } from "@/lib/tiktok-comments";
 import { extractTitleCandidates } from "@/lib/title-parser";
 import type { AnimeResult, TraceMoeResult, IdentifyResponse } from "@/types";
-
-const TIKTOK_URL_REGEX = /^https?:\/\/(www\.|vm\.|m\.)?tiktok\.com\/.+/;
+import { TIKTOK_URL_REGEX } from "@/lib/tiktok-url";
 // TikTok clips often have text overlays and color grading that reduce trace.moe similarity by 5–10%.
 // Single frame needs good confidence; consensus across 2+ frames is more reliable.
 const MIN_SIMILARITY_SINGLE = 0.80;

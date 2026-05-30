@@ -2,6 +2,7 @@
 
 import { useEffect, useRef } from "react";
 import { motion, AnimatePresence } from "motion/react";
+import { TIKTOK_URL_REGEX } from "@/lib/tiktok-url";
 
 interface SearchBarProps {
   url: string;
@@ -9,8 +10,6 @@ interface SearchBarProps {
   onSearch: () => void;
   isSearching: boolean;
 }
-
-const TIKTOK_URL_REGEX = /^https?:\/\/(www\.|vm\.|m\.)?tiktok\.com\/.+/;
 
 export default function SearchBar({
   url,

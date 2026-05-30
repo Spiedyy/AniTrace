@@ -7,6 +7,8 @@ import ProgressBar from "./components/ProgressBar";
 import ResultCard from "./components/ResultCard";
 import MalLoginButton from "./components/MalLoginButton";
 import Toast from "./components/Toast";
+import ShareFromTikTokTip from "./components/ShareFromTikTokTip";
+import { parseSharedTikTokUrl } from "@/lib/tiktok-url";
 import type { AnimeResult } from "@/types";
 
 type Phase = "idle" | "searching" | "results" | "error";
@@ -36,6 +38,7 @@ export default function Home() {
   const [watchlistStateByMalId, setWatchlistStateByMalId] = useState<Record<number, WatchlistActionState>>({});
   const pendingUpdateRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const activeSearchIdRef = useRef(0);
+  const shareHandledRef = useRef(false);
 
   const showToast = useCallback((msg: string) => {
     setToast(msg);
@@ -155,6 +158,25 @@ export default function Home() {
       setPhase("error");
     }
   }, [showToast]);
+
+  // TikTok share (Shortcut on iOS, Share Target on Android PWA)
+  useEffect(() => {
+    if (shareHandledRef.current) return;
+
+    const params = new URLSearchParams(window.location.search);
+    if (params.get("login") || params.get("error")) return;
+
+    const shared = parseSharedTikTokUrl(params);
+    if (!shared) return;
+
+    shareHandledRef.current = true;
+    setUrl(shared);
+    setResults([]);
+    setDismissedMalIds(new Set());
+    setWatchlistStateByMalId({});
+    window.history.replaceState({}, "", "/");
+    void runSearch(shared);
+  }, [runSearch]);
 
   const handleSearch = useCallback(async () => {
     if (!url.trim() || phase === "searching") return;
@@ -286,6 +308,8 @@ export default function Home() {
         onSearch={handleSearch}
         isSearching={phase === "searching"}
       />
+
+      <ShareFromTikTokTip />
 
       {/* Progress */}
       {phase === "searching" && (

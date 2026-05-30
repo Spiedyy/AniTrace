@@ -16,6 +16,10 @@ export const metadata: Metadata = {
   title: "AniTrace — Find Anime from TikTok",
   description:
     "Paste a TikTok link and instantly identify the anime. Powered by trace.moe and MyAnimeList.",
+  appleWebApp: {
+    capable: true,
+    title: "AniTrace",
+  },
 };
 
 export default function RootLayout({
