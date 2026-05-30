@@ -10,28 +10,45 @@ const ffmpegBin: string = require("ffmpeg-static");
 const UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
 
-/**
- * Crop+scale filter applied to every extracted frame.
- *
- * Removes the top 15 % and bottom 15 % of each frame before sending to
- * trace.moe.  Iceberg compilation videos consistently place text overlays
- * (anime title, rank number, subtitles) in these regions.  The perceptual
- * hash of those overlaid pixels lowers trace.moe similarity by 15–25 points.
- * Cropping the centre 70 % isolates the actual anime scene content.
- *
- * trunc(X/2)*2 rounds down to an even number — required by most video codecs.
- */
-const CROP_FILTER =
-  "crop=iw:trunc(ih*0.70/2)*2:0:trunc(ih*0.15/2)*2," +
-  "scale=640:640:force_original_aspect_ratio=decrease";
+/** Skip creator intro / commentary at the start of reaction-style TikToks. */
+const INTRO_SKIP_RATIO = 0.22;
+const INTRO_SKIP_MIN_S = 3;
+
+const SCALE = "scale=640:640:force_original_aspect_ratio=decrease";
 
 /**
- * Thin wrapper around ffmpeg spawn.  Returns stderr output regardless of
- * exit code so callers can log failure reasons.
- *
- * Using spawn (not exec) means args are passed verbatim — no shell
- * interpolation, no cmd.exe quote-nesting bugs on Windows.
+ * Multiple crops per timestamp — reaction videos often show anime in a small
+ * inset while the creator talks full-screen.
  */
+export const FRAME_VARIANTS = {
+  full: SCALE,
+  center:
+    "crop=iw:trunc(ih*0.70/2)*2:0:trunc(ih*0.15/2)*2," + SCALE,
+  bottomRight:
+    "crop=trunc(iw*0.48/2)*2:trunc(ih*0.48/2)*2:trunc(iw*0.52/2)*2:trunc(ih*0.52/2)*2," +
+    SCALE,
+  topRight:
+    "crop=trunc(iw*0.48/2)*2:trunc(ih*0.48/2)*2:trunc(iw*0.52/2)*2:0," + SCALE,
+  bottomLeft:
+    "crop=trunc(iw*0.48/2)*2:trunc(ih*0.48/2)*2:0:trunc(ih*0.52/2)*2," + SCALE,
+} as const;
+
+export type FrameVariant = keyof typeof FRAME_VARIANTS;
+
+export interface ExtractedFrame {
+  base64: string;
+  variant: FrameVariant;
+  /** Seconds into the video. */
+  timestampSec: number;
+}
+
+function introSkipSeconds(duration: number): number {
+  return Math.min(
+    Math.max(INTRO_SKIP_MIN_S, duration * INTRO_SKIP_RATIO),
+    Math.max(0, duration * 0.45)
+  );
+}
+
 async function spawnFfmpeg(
   args: string[],
   timeoutMs = 60_000
@@ -54,11 +71,13 @@ async function spawnFfmpeg(
       console.warn("[frame-extractor] spawn error:", err.message);
       finish(false);
     });
-    setTimeout(() => { child.kill(); finish(false); }, timeoutMs);
+    setTimeout(() => {
+      child.kill();
+      finish(false);
+    }, timeoutMs);
   });
 }
 
-/** Download via Node fetch. Rejects files smaller than 100 KB (error HTML pages, etc.). */
 async function downloadVideo(url: string, dest: string): Promise<boolean> {
   try {
     const res = await fetch(url, {
@@ -85,7 +104,6 @@ async function downloadVideo(url: string, dest: string): Promise<boolean> {
   }
 }
 
-/** Download via ffmpeg's built-in HTTP client (no shell — URL special chars are safe). */
 async function downloadWithFfmpeg(url: string, dest: string): Promise<boolean> {
   const { ok, stderr } = await spawnFfmpeg(
     [
@@ -106,24 +124,90 @@ async function downloadWithFfmpeg(url: string, dest: string): Promise<boolean> {
   return ok;
 }
 
-/**
- * Two-pass scene-change extraction (local file only).
- *
- * Pass 1 — detect cut timestamps via showinfo filter stderr output.
- * Pass 2 — seek to ts + STABLE_OFFSET_S per cut.
- *
- * STABLE_OFFSET_S = 1.5 s skips iceberg title cards (usually 1–3 s long)
- * that would otherwise produce text-heavy, low-similarity frames.
- */
-async function extractSceneFrames(
-  videoPath: string,
+async function captureFrame(
+  source: string,
+  seekSec: number,
+  vf: string,
+  framePath: string,
+  isUrl: boolean
+): Promise<boolean> {
+  const args = [
+    ...(isUrl ? ["-user_agent", UA, "-headers", "Referer: https://www.tiktok.com/\r\n"] : []),
+    "-ss", seekSec.toFixed(3),
+    "-i", source,
+    "-vf", vf,
+    "-vframes", "1",
+    "-q:v", "4",
+    framePath,
+    "-y",
+  ];
+  const { ok } = await spawnFfmpeg(args, 45_000);
+  if (!ok) return false;
+  try {
+    await readFile(framePath);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function extractVariantsAtTimestamp(
+  source: string,
+  timestampSec: number,
   tmpDir: string,
-  maxFrames = 12,
-  sceneThreshold = 0.15
-): Promise<string[]> {
-  // ── Pass 1: collect scene-cut timestamps ────────────────────────────────────
-  // No shell involved — filter uses plain comma, no escaping needed.
-  const { stderr: passOneStderr } = await spawnFfmpeg(
+  prefix: string,
+  variants: FrameVariant[],
+  isUrl: boolean
+): Promise<ExtractedFrame[]> {
+  const frames: ExtractedFrame[] = [];
+
+  for (const variant of variants) {
+    const framePath = path.join(
+      tmpDir,
+      `${prefix}_${variant}_${Math.round(timestampSec * 1000)}.jpg`
+    );
+    const ok = await captureFrame(
+      source,
+      timestampSec,
+      FRAME_VARIANTS[variant],
+      framePath,
+      isUrl
+    );
+    if (!ok) continue;
+
+    try {
+      const base64 = (await readFile(framePath)).toString("base64");
+      frames.push({
+        base64: `data:image/jpeg;base64,${base64}`,
+        variant,
+        timestampSec,
+      });
+    } catch {
+      // skip unreadable output
+    }
+  }
+
+  return frames;
+}
+
+function dedupeTimestamps(timestamps: number[], minGapSec = 1.2): number[] {
+  const sorted = [...timestamps].sort((a, b) => a - b);
+  const out: number[] = [];
+  for (const ts of sorted) {
+    if (out.length === 0 || ts - out[out.length - 1] >= minGapSec) {
+      out.push(ts);
+    }
+  }
+  return out;
+}
+
+/** Scene cuts after the intro — skips commentary at the start. */
+async function collectSceneTimestamps(
+  videoPath: string,
+  duration: number,
+  sceneThreshold = 0.12
+): Promise<number[]> {
+  const { stderr } = await spawnFfmpeg(
     [
       "-i", videoPath,
       "-vf", `select=gt(scene,${sceneThreshold}),showinfo`,
@@ -133,104 +217,89 @@ async function extractSceneFrames(
     120_000
   );
 
+  const introSkip = introSkipSeconds(duration);
   const timestamps: number[] = [];
-  for (const m of passOneStderr.matchAll(/pts_time:([\d.]+)/g)) {
-    timestamps.push(parseFloat(m[1]));
-  }
-  console.log(`[frame-extractor] Scene detection found ${timestamps.length} cut(s)`);
-  if (timestamps.length === 0) return [];
-
-  // ── Pass 2: extract stable frame 1.5 s after each cut ───────────────────────
-  const STABLE_OFFSET_S = 1.5;
-  const frames: string[] = [];
-
-  for (const ts of timestamps.slice(0, maxFrames)) {
-    const idx = String(frames.length).padStart(4, "0");
-    const framePath = path.join(tmpDir, `scene${idx}.jpg`);
-    let captured = false;
-
-    for (const offset of [STABLE_OFFSET_S, 0.7, 0.2, 0]) {
-      const seekTs = Math.max(0, ts + offset).toFixed(3);
-      const { ok } = await spawnFfmpeg([
-        "-ss", seekTs,
-        "-i", videoPath,
-        "-vf", CROP_FILTER,
-        "-vframes", "1",
-        "-q:v", "5",
-        framePath,
-        "-y",
-      ]);
-      if (ok) {
-        try {
-          frames.push(
-            `data:image/jpeg;base64,${(await readFile(framePath)).toString("base64")}`
-          );
-          captured = true;
-          break;
-        } catch {
-          // file not written despite exit 0 — try shorter offset
-        }
-      }
-    }
-    if (!captured) break;
+  for (const m of stderr.matchAll(/pts_time:([\d.]+)/g)) {
+    const ts = parseFloat(m[1]);
+    if (ts >= introSkip) timestamps.push(ts);
   }
 
-  return frames;
+  console.log(
+    `[frame-extractor] Scene detection: ${timestamps.length} cut(s) after ${introSkip.toFixed(1)}s intro skip`
+  );
+  return dedupeTimestamps(timestamps);
 }
 
-/**
- * Evenly-spaced frames from a local video file or a remote HTTP URL.
- *
- * When `source` is an HTTP URL ffmpeg uses Range requests to seek without
- * downloading the full file — this is Strategy 2 when the full download fails.
- *
- * Uses spawn (not exec) so filter strings and URL special chars pass verbatim
- * with no shell interpolation.
- */
-async function extractEvenFrames(
+function buildEvenTimestamps(duration: number, count: number): number[] {
+  const introSkip = introSkipSeconds(duration);
+  const start = Math.max(introSkip, duration * 0.25);
+  const end = duration * 0.97;
+  if (end <= start) return [Math.min(introSkip, duration * 0.5)];
+
+  const timestamps: number[] = [];
+  const step = count > 1 ? (end - start) / (count - 1) : 0;
+  for (let i = 0; i < count; i++) {
+    timestamps.push(start + step * i);
+  }
+  return timestamps;
+}
+
+/** Prefer later timestamps and PiP corner crops — common in commentary TikToks. */
+export function sortFramesForSearch(frames: ExtractedFrame[]): ExtractedFrame[] {
+  const variantPriority: Record<FrameVariant, number> = {
+    bottomRight: 0,
+    topRight: 1,
+    bottomLeft: 2,
+    full: 3,
+    center: 4,
+  };
+
+  return [...frames].sort((a, b) => {
+    if (b.timestampSec !== a.timestampSec) return b.timestampSec - a.timestampSec;
+    return variantPriority[a.variant] - variantPriority[b.variant];
+  });
+}
+
+/** Flat base64 list for AI fallback — later frames and inset crops first. */
+export function framesForAiIdentification(frames: ExtractedFrame[], limit = 8): string[] {
+  return sortFramesForSearch(frames)
+    .slice(0, limit)
+    .map((f) => f.base64);
+}
+
+async function extractFromSource(
   source: string,
   duration: number,
   tmpDir: string,
-  frameCount = 8,
-  prefix = "even"
-): Promise<string[]> {
+  sceneTimestamps: number[],
+  prefix: string
+): Promise<ExtractedFrame[]> {
   const isUrl = source.startsWith("http://") || source.startsWith("https://");
-  const safeDuration = Math.max(duration, 1);
-  const start = safeDuration * 0.05;
-  const end = safeDuration * 0.95;
-  const step = frameCount > 1 ? (end - start) / (frameCount - 1) : 0;
-  const frames: string[] = [];
+  const pipVariants: FrameVariant[] = ["bottomRight", "topRight", "full", "center"];
+  const evenVariants: FrameVariant[] = ["bottomRight", "full", "topRight"];
 
-  for (let i = 0; i < frameCount; i++) {
-    const timestamp = (start + step * i).toFixed(2);
-    const framePath = path.join(tmpDir, `${prefix}${i}.jpg`);
+  const evenTimestamps = buildEvenTimestamps(duration, 6);
+  const sceneSample = dedupeTimestamps(sceneTimestamps).slice(-6);
+  const allTimestamps = dedupeTimestamps([...evenTimestamps, ...sceneSample]).slice(-10);
 
-    const args = [
-      // HTTP headers only needed for remote URLs
-      ...(isUrl ? ["-user_agent", UA, "-headers", "Referer: https://www.tiktok.com/\r\n"] : []),
-      "-ss", timestamp,
-      "-i", source,
-      "-vf", CROP_FILTER,
-      "-vframes", "1",
-      "-q:v", "5",
-      framePath,
-      "-y",
-    ];
+  console.log(
+    `[frame-extractor] Sampling ${allTimestamps.length} timestamp(s):`,
+    allTimestamps.map((t) => t.toFixed(1) + "s").join(", ")
+  );
 
-    const { ok, stderr } = await spawnFfmpeg(args, 45_000);
-    if (ok) {
-      try {
-        frames.push(
-          `data:image/jpeg;base64,${(await readFile(framePath)).toString("base64")}`
-        );
-      } catch {
-        // file not written despite exit 0 — skip
-      }
-    } else if (i === 0) {
-      // Log first failure so we know what's going wrong
-      const tail = stderr.split("\n").filter(Boolean).slice(-3).join(" | ");
-      console.warn(`[frame-extractor] Even frame 0 @ ${timestamp}s failed — ${tail}`);
-    }
+  const frames: ExtractedFrame[] = [];
+  for (const ts of allTimestamps) {
+    const isSceneCut = sceneSample.some((s) => Math.abs(s - ts) < 0.5);
+    const variants = isSceneCut ? pipVariants : evenVariants;
+    const batch = await extractVariantsAtTimestamp(
+      source,
+      ts,
+      tmpDir,
+      prefix,
+      variants,
+      isUrl
+    );
+    frames.push(...batch);
   }
 
   return frames;
@@ -239,20 +308,14 @@ async function extractEvenFrames(
 /**
  * Main entry point.
  *
- * Strategy (in order):
- * 1. Try downloading the full video (proxy URL first, then CDN fallbacks).
- *    On success: extract scene-change frames + evenly-spaced frames (up to 14).
- * 2. If download fails: extract evenly-spaced frames directly from each URL
- *    using ffmpeg's built-in HTTP client (Range-request seeking, no full download).
- *    This bypasses IP-restricted TikTok CDN tokens by trying the TikWM proxy URL.
- *
- * @param altVideoUrls  Fallback URLs tried in order if the primary URL fails.
+ * Extracts multiple crops per timestamp (full frame + inset corners) and skips
+ * the opening commentary segment common in reaction TikToks.
  */
 export async function extractFrames(
   videoUrl: string,
   duration: number,
   altVideoUrls: string[] = []
-): Promise<string[]> {
+): Promise<ExtractedFrame[]> {
   const id = crypto.randomBytes(8).toString("hex");
   const tmpDir = path.join(tmpdir(), `anitrace-${id}`);
   const videoPath = path.join(tmpDir, "input.mp4");
@@ -262,35 +325,33 @@ export async function extractFrames(
 
     const urlsToTry = [videoUrl, ...altVideoUrls].filter(Boolean);
 
-    // ── Strategy 1: full download → scene + even frames ─────────────────────
     let downloaded = false;
     for (const url of urlsToTry) {
-      if (await downloadVideo(url, videoPath)) { downloaded = true; break; }
+      if (await downloadVideo(url, videoPath)) {
+        downloaded = true;
+        break;
+      }
       console.log("[frame-extractor] Fetch failed — retrying with ffmpeg download");
-      if (await downloadWithFfmpeg(url, videoPath)) { downloaded = true; break; }
+      if (await downloadWithFfmpeg(url, videoPath)) {
+        downloaded = true;
+        break;
+      }
     }
 
     if (downloaded) {
-      const sceneFrames = await extractSceneFrames(videoPath, tmpDir);
-      console.log("[frame-extractor] Scene frames:", sceneFrames.length);
-
-      const evenTarget = Math.max(4, 10 - sceneFrames.length);
-      const evenFrames = await extractEvenFrames(videoPath, duration, tmpDir, evenTarget, "even");
-      console.log("[frame-extractor] Even frames:", evenFrames.length);
-
-      const combined = [...sceneFrames, ...evenFrames].slice(0, 14);
-      console.log("[frame-extractor] Total frames (downloaded):", combined.length);
-      return combined;
+      const sceneTimestamps = await collectSceneTimestamps(videoPath, duration);
+      const frames = await extractFromSource(videoPath, duration, tmpDir, sceneTimestamps, "dl");
+      console.log("[frame-extractor] Total frame variants (downloaded):", frames.length);
+      return sortFramesForSearch(frames);
     }
 
-    // ── Strategy 2: direct URL → evenly-spaced frames via ffmpeg HTTP ────────
-    console.log("[frame-extractor] Download failed for all URLs — trying direct URL extraction");
+    console.log("[frame-extractor] Download failed — trying direct URL extraction");
     for (const url of urlsToTry) {
       console.log(`[frame-extractor] Direct URL extraction: ${url.slice(0, 80)}...`);
-      const frames = await extractEvenFrames(url, duration, tmpDir, 8, "urlframe");
+      const frames = await extractFromSource(url, duration, tmpDir, [], "url");
       if (frames.length > 0) {
-        console.log(`[frame-extractor] Direct URL extraction succeeded: ${frames.length} frames`);
-        return frames;
+        console.log(`[frame-extractor] Direct URL extraction succeeded: ${frames.length} variants`);
+        return sortFramesForSearch(frames);
       }
     }
 

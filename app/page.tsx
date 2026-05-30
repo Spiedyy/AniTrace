@@ -7,21 +7,26 @@ import ProgressBar from "./components/ProgressBar";
 import ResultCard from "./components/ResultCard";
 import MalLoginButton from "./components/MalLoginButton";
 import Toast from "./components/Toast";
-import ShareFromTikTokTip from "./components/ShareFromTikTokTip";
 import { parseSharedTikTokUrl } from "@/lib/tiktok-url";
+import {
+  listenForShareHandoff,
+  tryCloseHandoffTab,
+  tryDelegateShareToExistingTab,
+} from "@/lib/share-tab-handoff";
+import {
+  isLikelyBackgroundFetchFailure,
+  trackHiddenDuringTask,
+  type InterruptedSearch,
+} from "@/lib/search-interruption";
+import {
+  LABEL_FINISHING,
+  LABEL_PAUSED,
+  startSearchProgress,
+} from "@/lib/search-progress";
 import type { AnimeResult } from "@/types";
 
 type Phase = "idle" | "searching" | "results" | "error";
 type WatchlistActionState = "idle" | "saving" | "added" | "already_completed";
-
-const PROGRESS_STEPS = [
-  { pct: 15, label: "Validating TikTok URL..." },
-  { pct: 30, label: "Fetching video from TikWM..." },
-  { pct: 50, label: "Extracting key frames..." },
-  { pct: 70, label: "Searching trace.moe database..." },
-  { pct: 85, label: "Fetching anime details from MAL..." },
-  { pct: 95, label: "Processing results..." },
-];
 
 export default function Home() {
   const [url, setUrl] = useState("");
@@ -39,6 +44,9 @@ export default function Home() {
   const pendingUpdateRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const activeSearchIdRef = useRef(0);
   const shareHandledRef = useRef(false);
+  const tabIdRef = useRef(crypto.randomUUID());
+  const interruptedSearchRef = useRef<InterruptedSearch | null>(null);
+  const [shareHandoff, setShareHandoff] = useState(false);
 
   const showToast = useCallback((msg: string) => {
     setToast(msg);
@@ -72,6 +80,7 @@ export default function Home() {
   const runSearch = useCallback(async (searchUrl: string, excludeIds: number[] = []) => {
     activeSearchIdRef.current += 1;
     const searchId = activeSearchIdRef.current;
+    interruptedSearchRef.current = null;
 
     // Cancel any delayed state update still pending from a previous search.
     // Without this, a stale setTimeout can fire mid-search, showing an old toast
@@ -86,19 +95,13 @@ export default function Home() {
     setError(null);
     setExpandedIdx(null);
 
-    // Animate progress while the real request runs in parallel
-    let stepIdx = 0;
-    const stepInterval = setInterval(() => {
-      if (stepIdx < PROGRESS_STEPS.length) {
-        setProgress(PROGRESS_STEPS[stepIdx].pct);
-        setProgressLabel(PROGRESS_STEPS[stepIdx].label);
-        stepIdx++;
-      } else {
-        setProgress(95);
-        setProgressLabel("Almost done...");
-        clearInterval(stepInterval);
-      }
-    }, 900);
+    const stopProgress = startSearchProgress((pct, label) => {
+      if (searchId !== activeSearchIdRef.current) return;
+      setProgress(pct);
+      setProgressLabel(label);
+    });
+
+    const visibilityTracker = trackHiddenDuringTask();
 
     try {
       const body: Record<string, unknown> = { url: searchUrl };
@@ -111,13 +114,13 @@ export default function Home() {
       });
 
       if (searchId !== activeSearchIdRef.current) {
-        clearInterval(stepInterval);
+        stopProgress();
         return;
       }
 
-      clearInterval(stepInterval);
+      stopProgress();
       setProgress(100);
-      setProgressLabel("Done!");
+      setProgressLabel(LABEL_FINISHING);
 
       const data = await response.json();
 
@@ -148,16 +151,69 @@ export default function Home() {
           }
         }
       }, 400);
-    } catch {
+    } catch (error) {
       if (searchId !== activeSearchIdRef.current) {
-        clearInterval(stepInterval);
+        stopProgress();
         return;
       }
-      clearInterval(stepInterval);
+      stopProgress();
+
+      // Mobile browsers abort in-flight fetch when the tab is backgrounded, even
+      // though the server keeps running. Pause and retry when the user returns.
+      if (
+        visibilityTracker.wasHidden() &&
+        isLikelyBackgroundFetchFailure(error)
+      ) {
+        if (document.visibilityState === "visible") {
+          void runSearch(searchUrl, excludeIds);
+          return;
+        }
+
+        interruptedSearchRef.current = { url: searchUrl, excludeIds };
+        setProgressLabel(LABEL_PAUSED);
+        return;
+      }
+
       setError("Network error. Please check your connection and try again.");
       setPhase("error");
+    } finally {
+      visibilityTracker.cleanup();
     }
   }, [showToast]);
+
+  // Resume identify requests interrupted by backgrounding the tab.
+  useEffect(() => {
+    const resume = () => {
+      if (document.visibilityState !== "visible") return;
+      const pending = interruptedSearchRef.current;
+      if (!pending) return;
+      interruptedSearchRef.current = null;
+      void runSearch(pending.url, pending.excludeIds);
+    };
+
+    document.addEventListener("visibilitychange", resume);
+    return () => document.removeEventListener("visibilitychange", resume);
+  }, [runSearch]);
+
+  const handleIncomingShare = useCallback(
+    (shared: string) => {
+      shareHandledRef.current = true;
+      setShareHandoff(false);
+      setUrl(shared);
+      setResults([]);
+      setDismissedMalIds(new Set());
+      setWatchlistStateByMalId({});
+      window.history.replaceState({}, "", "/");
+      void runSearch(shared);
+    },
+    [runSearch]
+  );
+
+  // Existing tabs: accept shares from new Shortcut tabs instead of opening duplicates.
+  useEffect(
+    () => listenForShareHandoff(tabIdRef.current, handleIncomingShare),
+    [handleIncomingShare]
+  );
 
   // TikTok share (Shortcut on iOS, Share Target on Android PWA)
   useEffect(() => {
@@ -169,14 +225,20 @@ export default function Home() {
     const shared = parseSharedTikTokUrl(params);
     if (!shared) return;
 
-    shareHandledRef.current = true;
-    setUrl(shared);
-    setResults([]);
-    setDismissedMalIds(new Set());
-    setWatchlistStateByMalId({});
-    window.history.replaceState({}, "", "/");
-    void runSearch(shared);
-  }, [runSearch]);
+    void (async () => {
+      const delegated = await tryDelegateShareToExistingTab(shared, tabIdRef.current);
+      window.history.replaceState({}, "", "/");
+
+      if (delegated) {
+        shareHandledRef.current = true;
+        setShareHandoff(true);
+        tryCloseHandoffTab();
+        return;
+      }
+
+      handleIncomingShare(shared);
+    })();
+  }, [handleIncomingShare]);
 
   const handleSearch = useCallback(async () => {
     if (!url.trim() || phase === "searching") return;
@@ -309,7 +371,24 @@ export default function Home() {
         isSearching={phase === "searching"}
       />
 
-      <ShareFromTikTokTip />
+
+      {shareHandoff && (
+        <p
+          style={{
+            marginTop: "16px",
+            padding: "12px 14px",
+            fontSize: "13px",
+            lineHeight: 1.5,
+            color: "var(--color-text-secondary)",
+            background: "var(--color-background-primary)",
+            border: "1px solid var(--color-border-tertiary)",
+            borderRadius: "12px",
+          }}
+        >
+          Link sent to your open AniTrace tab. Switch back to Safari to see the
+          search — you can close this tab.
+        </p>
+      )}
 
       {/* Progress */}
       {phase === "searching" && (
@@ -328,7 +407,7 @@ export default function Home() {
               marginBottom: "8px",
             }}
           >
-            🔍 Debug — {debugImages.length} image{debugImages.length !== 1 ? "s" : ""} sent to trace.moe
+            🔍 Debug — {debugImages.length} frame{debugImages.length !== 1 ? "s" : ""} analyzed
           </summary>
           <div style={{ display: "flex", gap: "8px", flexWrap: "wrap" }}>
             {debugImages.map((src, i) => (
@@ -488,9 +567,9 @@ export default function Home() {
               <strong style={{ color: "var(--color-text-secondary)" }}>
                 How it works:
               </strong>{" "}
-              AniTrace downloads the TikTok video, extracts keyframes, and sends
-              them to trace.moe&apos;s anime scene database. The best match is
-              then looked up on MyAnimeList for full details.
+              AniTrace analyzes your TikTok clip and matches it against anime
+              databases to find what you&apos;re watching, with full show details
+              when available.
             </div>
           </div>
         );

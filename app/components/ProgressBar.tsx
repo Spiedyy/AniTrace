@@ -8,8 +8,39 @@ interface ProgressBarProps {
 }
 
 export default function ProgressBar({ progress, label }: ProgressBarProps) {
+  const clamped = Math.min(100, Math.max(0, progress));
+
   return (
     <div style={{ marginTop: "24px" }}>
+      <div
+        style={{
+          display: "flex",
+          justifyContent: "space-between",
+          alignItems: "baseline",
+          marginBottom: "8px",
+          gap: "12px",
+        }}
+      >
+        <span
+          style={{
+            fontSize: "12px",
+            fontWeight: 500,
+            color: "var(--color-text-tertiary)",
+            letterSpacing: "0.02em",
+          }}
+        >
+          Identifying anime
+        </span>
+        <span
+          style={{
+            fontSize: "12px",
+            fontVariantNumeric: "tabular-nums",
+            color: "var(--color-text-tertiary)",
+          }}
+        >
+          {clamped}%
+        </span>
+      </div>
       <div
         style={{
           height: "4px",
@@ -24,8 +55,8 @@ export default function ProgressBar({ progress, label }: ProgressBarProps) {
             borderRadius: "2px",
             background: "linear-gradient(90deg, #6366f1, #a855f7)",
           }}
-          animate={{ width: `${progress}%` }}
-          transition={{ duration: 0.4, ease: "easeOut" }}
+          animate={{ width: `${clamped}%` }}
+          transition={{ duration: 0.35, ease: "easeOut" }}
         />
       </div>
       <p

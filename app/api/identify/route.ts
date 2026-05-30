@@ -3,7 +3,7 @@ import { fetchTikTokVideo } from "@/lib/tikwm";
 import { searchByBuffer } from "@/lib/tracemoe";
 import { getMediaByAnilistId } from "@/lib/anilist";
 import { getAnimeById, searchAnimeByTitle, JikanAnime } from "@/lib/jikan";
-import { extractFrames } from "@/lib/frame-extractor";
+import { extractFrames, framesForAiIdentification, type ExtractedFrame } from "@/lib/frame-extractor";
 import { identifyAnimeFromImages, readAnimeNamesFromSlide } from "@/lib/ai-identify";
 import {
   fetchComments, fetchCommentReplies,
@@ -356,6 +356,7 @@ export async function POST(request: NextRequest): Promise<Response> {
     let coverOnly = false;
     const allTraceMoeResults: TraceMoeResult[] = [];
     const debugImages: string[] = [];
+    let extractedFrames: ExtractedFrame[] = [];
 
     // Declared here (before slideshow block) so both slideshow and video paths share them.
     interface EnrichedResult { animeResult: AnimeResult; hashtagMatch: boolean; }
@@ -484,38 +485,47 @@ export async function POST(request: NextRequest): Promise<Response> {
         }
       }
     } else {
-      // Regular video — extract frames with scene detection
-      let frames: string[] = [];
+      // Regular video — multi-crop frames, biased past intro commentary
       try {
         // Priority order: TikWM proxy (no IP restriction) → HD CDN → plain CDN → watermarked CDN
         const altUrls = [
           videoInfo.hdVideoUrl,
           videoInfo.wmVideoUrl,
         ].filter((u): u is string => !!u);
-        frames = await extractFrames(
+        extractedFrames = await extractFrames(
           videoInfo.tikwmProxyUrl, // try proxy first — immune to TikTok CDN IP-binding
           videoInfo.duration,
           [videoInfo.videoUrl, ...altUrls]  // CDN URLs as fallbacks
         );
-        console.log("[identify] Extracted frames:", frames.length);
+        console.log("[identify] Extracted frame variants:", extractedFrames.length);
       } catch (err) {
         console.warn("[identify] Frame extraction error:", err);
       }
 
       let quotaDepleted = false;
-      for (let i = 0; i < frames.length; i++) {
+      for (let i = 0; i < extractedFrames.length; i++) {
         if (quotaDepleted) break;
-        const frame = frames[i];
+        const { base64: frame, variant, timestampSec } = extractedFrames[i];
         debugImages.push(frame);
-        // Convert base64 data URL back to raw bytes and send as multipart —
-        // the same path used for cover images, which is known to work.
         const base64Data = frame.replace(/^data:image\/[^;]+;base64,/, "");
         const frameBuffer = Buffer.from(base64Data, "base64");
         const frameSizeKB = Math.round(frameBuffer.length / 1024);
         try {
           const result = await searchByBuffer(frameBuffer.buffer as ArrayBuffer, "image/jpeg");
-          console.log(`[identify] Frame ${i + 1} (${frameSizeKB} KB) results:`, result.result?.length ?? 0);
+          console.log(
+            `[identify] Frame ${i + 1} ${variant}@${timestampSec.toFixed(1)}s (${frameSizeKB} KB) results:`,
+            result.result?.length ?? 0
+          );
           if (result.result) allTraceMoeResults.push(...result.result);
+
+          // Stop early once we have a confident visual match.
+          const confident = getBestMatches(allTraceMoeResults);
+          if (confident.length > 0 && confident[0].avgSimilarity >= 0.78) {
+            console.log(
+              `[identify] Early exit — ${(confident[0].avgSimilarity * 100).toFixed(1)}% match at ${variant}@${timestampSec.toFixed(1)}s`
+            );
+            break;
+          }
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
           if (msg.includes(": 402")) {
@@ -540,7 +550,7 @@ export async function POST(request: NextRequest): Promise<Response> {
       }
 
       // If frame extraction yielded nothing, fall back to origin/portrait cover
-      if (frames.length === 0) {
+      if (extractedFrames.length === 0) {
         coverOnly = true;
         const coverUrls: string[] = [];
         if (videoInfo.originCoverUrl) coverUrls.push(videoInfo.originCoverUrl);
@@ -718,14 +728,27 @@ export async function POST(request: NextRequest): Promise<Response> {
       }
     }
 
-    // Step 5d: Claude AI vision identification — last resort only.
-    // Reaches here only when title/comment text search AND trace.moe both failed.
-    const shouldRunAI = enriched.length === 0;
+    // Step 5d: AI vision — when nothing matched, or visual matches are too weak
+    // (common for reaction/commentary TikToks with tiny inset anime clips).
+    const maxVisualSimilarity = allTraceMoeResults.reduce(
+      (max, r) => Math.max(max, r.similarity),
+      0
+    );
+    const shouldRunAI =
+      enriched.length === 0 ||
+      (maxVisualSimilarity > 0 && maxVisualSimilarity < 0.58);
 
-    if (shouldRunAI && debugImages.length > 0) {
-      console.log(`[identify] Running AI identification (enriched so far: ${enriched.length})`);
+    const aiFrameSource =
+      !isSlideshow && extractedFrames.length > 0
+        ? framesForAiIdentification(extractedFrames, 8)
+        : debugImages;
+
+    if (shouldRunAI && aiFrameSource.length > 0) {
+      console.log(
+        `[identify] Running AI identification (enriched: ${enriched.length}, max visual: ${(maxVisualSimilarity * 100).toFixed(1)}%)`
+      );
       try {
-        const aiMatch = await identifyAnimeFromImages(debugImages);
+        const aiMatch = await identifyAnimeFromImages(aiFrameSource);
         if (aiMatch && aiMatch.title) {
           const searchTitles = [aiMatch.title, ...aiMatch.alternativeTitles].filter(Boolean);
           let jikanAnime: JikanAnime | null = null;

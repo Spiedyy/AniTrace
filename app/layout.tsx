@@ -15,7 +15,7 @@ const geistMono = Geist_Mono({
 export const metadata: Metadata = {
   title: "AniTrace — Find Anime from TikTok",
   description:
-    "Paste a TikTok link and instantly identify the anime. Powered by trace.moe and MyAnimeList.",
+    "Paste a TikTok link and instantly identify the anime in the clip.",
   appleWebApp: {
     capable: true,
     title: "AniTrace",

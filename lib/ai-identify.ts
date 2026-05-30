@@ -54,7 +54,7 @@ export async function readAnimeNamesFromSlide(base64Image: string): Promise<stri
   }
 }
 
-const SYSTEM_PROMPT = `You are an expert anime identifier. Given screenshots from an anime video, identify which anime series they are from.
+const SYSTEM_PROMPT = `You are an expert anime identifier. Given screenshots from a TikTok video, identify which anime series is being shown.
 
 Respond ONLY with a JSON object in this exact format (no markdown, no explanation outside the JSON):
 {
@@ -70,7 +70,9 @@ Guidelines:
 - "confidence": "high" = very distinctive art style/characters, "medium" = likely but uncertain, "low" = guessing
 - If genuinely unidentifiable, set title to "" and confidence to "low"
 - Focus on: art style, character designs, color palette, setting, distinctive visual elements
-- Ignore any text overlays — they may be added by TikTok and are NOT part of the original anime`;
+- Many TikToks are reaction/commentary videos: the creator may talk first, then show anime in a SMALL INSET or picture-in-picture box. Look carefully at corner insets and any small anime footage — ignore the person's face/webcam
+- Frames may be cropped to focus on inset regions — prioritize anime content over overlays
+- Ignore TikTok text overlays, usernames, and captions`;
 
 /**
  * Uses Claude's vision capability to identify anime from extracted video frames.
@@ -86,8 +88,8 @@ export async function identifyAnimeFromImages(
   }
   if (base64Images.length === 0) return null;
 
-  // Use at most 5 frames to keep token cost reasonable
-  const images = base64Images.slice(0, 5);
+  // Use at most 8 frames — later timestamps and inset crops are sorted first
+  const images = base64Images.slice(0, 8);
 
   try {
     const imageBlocks: Anthropic.ImageBlockParam[] = images.map((img) => {
@@ -114,7 +116,7 @@ export async function identifyAnimeFromImages(
             ...imageBlocks,
             {
               type: "text",
-              text: `These are ${images.length} frame(s) extracted from a TikTok video about anime. Identify the anime series shown.`,
+              text: `These are ${images.length} frame(s) from a TikTok about anime. The video may include creator commentary with anime shown in a small inset — identify the anime series, not the creator.`,
             },
           ],
         },
