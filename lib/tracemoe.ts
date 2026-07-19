@@ -43,7 +43,8 @@ export async function searchByBase64(base64Image: string): Promise<TraceMoeRespo
  */
 export async function searchByBuffer(
   buffer: ArrayBuffer | Buffer | Uint8Array,
-  mimeType: string
+  mimeType: string,
+  timeoutMs = 8_000
 ): Promise<TraceMoeResponse> {
   const bytes =
     buffer instanceof Buffer || buffer instanceof Uint8Array
@@ -57,14 +58,21 @@ export async function searchByBuffer(
   const form = new FormData();
   form.append("image", new Blob([toArrayBuffer(bytes)], { type: mimeType }), "frame.jpg");
 
-  const response = await fetch(`${BASE_URL}/search?cutBorders=true`, {
-    method: "POST",
-    headers: getHeaders(), // no Content-Type — let fetch set the multipart boundary
-    body: form,
-  });
-  if (!response.ok) {
-    const body = await response.text().catch(() => "");
-    throw new Error(`trace.moe request failed: ${response.status} — ${body}`);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch(`${BASE_URL}/search?cutBorders=true`, {
+      method: "POST",
+      headers: getHeaders(), // no Content-Type — let fetch set the multipart boundary
+      body: form,
+      signal: controller.signal,
+    });
+    if (!response.ok) {
+      const body = await response.text().catch(() => "");
+      throw new Error(`trace.moe request failed: ${response.status} — ${body}`);
+    }
+    return response.json();
+  } finally {
+    clearTimeout(timer);
   }
-  return response.json();
 }

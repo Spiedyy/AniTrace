@@ -16,11 +16,11 @@ import { extractTitleCandidates } from "@/lib/title-parser";
 import type { AnimeResult, TraceMoeResult, IdentifyResponse } from "@/types";
 import { TIKTOK_URL_REGEX } from "@/lib/tiktok-url";
 
-export const maxDuration = 30;
+export const maxDuration = 60;
 
-/** Leave headroom before Vercel's hard 30s kill. */
-const IDENTIFY_DEADLINE_MS = process.env.VERCEL ? 27_000 : 120_000;
-const MAX_TRACE_MOE_SEARCHES = process.env.VERCEL ? 10 : 36;
+/** Leave headroom before Vercel's hard kill (maxDuration). */
+const IDENTIFY_DEADLINE_MS = process.env.VERCEL ? 55_000 : 120_000;
+const MAX_TRACE_MOE_SEARCHES = process.env.VERCEL ? 8 : 36;
 /** Jikan sleep + fetch — reserve this much before starting a fallback batch. */
 const JIKAN_CALL_BUDGET_MS = 800;
 // TikTok clips often have text overlays and color grading that reduce trace.moe similarity by 5–10%.
@@ -423,12 +423,15 @@ export async function POST(request: NextRequest): Promise<Response> {
     const uniqueVideoSources = [...new Set(videoSources)];
 
     // Start slow I/O early so text early-exit and visual search overlap.
+    // Leave ~18s for trace.moe + enrichment after frame extraction.
+    const frameDeadlineAt = startedAt + IDENTIFY_DEADLINE_MS - 18_000;
     const framesPromise: Promise<ExtractedFrame[]> =
       !isSlideshow
         ? extractFrames(
             uniqueVideoSources[0],
             videoInfo.duration,
-            uniqueVideoSources.slice(1)
+            uniqueVideoSources.slice(1),
+            frameDeadlineAt
           )
         : Promise.resolve([]);
 

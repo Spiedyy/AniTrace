@@ -5,7 +5,7 @@ import path from "path";
 import crypto from "crypto";
 import { isValidSearchImage, TRACE_MOE_MAX_BYTES } from "@/lib/image-bytes";
 
-/** Vercel functions have a hard 30s wall — keep ffmpeg work bounded. */
+/** Vercel functions have a hard duration wall — keep ffmpeg work bounded. */
 const IS_SERVERLESS = !!process.env.VERCEL;
 
 // eslint-disable-next-line @typescript-eslint/no-require-imports
@@ -60,7 +60,7 @@ function introSkipSeconds(duration: number): number {
 
 async function spawnFfmpeg(
   args: string[],
-  timeoutMs = IS_SERVERLESS ? 18_000 : 60_000
+  timeoutMs = IS_SERVERLESS ? 15_000 : 60_000
 ): Promise<{ ok: boolean; stderr: string }> {
   return new Promise((resolve) => {
     const child = spawn(ffmpegBin, args);
@@ -88,9 +88,13 @@ async function spawnFfmpeg(
 }
 
 async function downloadVideo(url: string, dest: string): Promise<boolean> {
+  const controller = new AbortController();
+  const timeoutMs = IS_SERVERLESS ? 12_000 : 45_000;
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
     const res = await fetch(url, {
       headers: { "User-Agent": UA, Referer: "https://www.tiktok.com/" },
+      signal: controller.signal,
     });
     if (!res.ok) {
       console.warn(`[frame-extractor] Fetch ${res.status} for video URL`);
@@ -110,10 +114,13 @@ async function downloadVideo(url: string, dest: string): Promise<boolean> {
   } catch (err) {
     console.warn("[frame-extractor] Fetch download error:", err);
     return false;
+  } finally {
+    clearTimeout(timer);
   }
 }
 
 async function downloadWithFfmpeg(url: string, dest: string): Promise<boolean> {
+  // Must stay under Vercel maxDuration — 90s previously guaranteed FUNCTION_INVOCATION_TIMEOUT.
   const { ok, stderr } = await spawnFfmpeg(
     [
       "-user_agent", UA,
@@ -122,7 +129,7 @@ async function downloadWithFfmpeg(url: string, dest: string): Promise<boolean> {
       "-c", "copy",
       "-y", dest,
     ],
-    90_000
+    IS_SERVERLESS ? 12_000 : 90_000
   );
   if (!ok) {
     const tail = stderr.split("\n").filter(Boolean).slice(-4).join(" | ");
@@ -265,7 +272,7 @@ async function collectSceneTimestamps(
   return dedupeTimestamps(timestamps);
 }
 
-function buildEvenTimestamps(duration: number, count = IS_SERVERLESS ? 4 : 6): number[] {
+function buildEvenTimestamps(duration: number, count = IS_SERVERLESS ? 3 : 6): number[] {
   const introSkip = introSkipSeconds(duration);
   const start = Math.max(introSkip, duration * 0.25);
   const end = duration * 0.97;
@@ -308,7 +315,8 @@ async function extractFromSource(
   duration: number,
   tmpDir: string,
   sceneTimestamps: number[],
-  prefix: string
+  prefix: string,
+  deadlineAt?: number
 ): Promise<ExtractedFrame[]> {
   const isUrl = source.startsWith("http://") || source.startsWith("https://");
   const pipVariants: FrameVariant[] = IS_SERVERLESS
@@ -320,7 +328,7 @@ async function extractFromSource(
 
   const evenTimestamps = buildEvenTimestamps(duration);
   const sceneSample = IS_SERVERLESS ? [] : dedupeTimestamps(sceneTimestamps).slice(-6);
-  const maxTimestamps = IS_SERVERLESS ? 5 : 10;
+  const maxTimestamps = IS_SERVERLESS ? 4 : 10;
   const allTimestamps = dedupeTimestamps([...evenTimestamps, ...sceneSample]).slice(-maxTimestamps);
 
   console.log(
@@ -330,6 +338,12 @@ async function extractFromSource(
 
   const frames: ExtractedFrame[] = [];
   for (const ts of allTimestamps) {
+    if (deadlineAt != null && Date.now() >= deadlineAt) {
+      console.warn(
+        `[frame-extractor] Deadline reached after ${frames.length} frame(s) — stopping extraction`
+      );
+      break;
+    }
     const isSceneCut = sceneSample.some((s) => Math.abs(s - ts) < 0.5);
     const variants = isSceneCut ? pipVariants : evenVariants;
     const batch = await extractVariantsAtTimestamp(
@@ -351,11 +365,15 @@ async function extractFromSource(
  *
  * Extracts multiple crops per timestamp (full frame + inset corners) and skips
  * the opening commentary segment common in reaction TikToks.
+ *
+ * @param deadlineAt - Optional wall-clock ms deadline; extraction stops early to leave
+ *   time for trace.moe / enrichment on Vercel.
  */
 export async function extractFrames(
   videoUrl: string,
   duration: number,
-  altVideoUrls: string[] = []
+  altVideoUrls: string[] = [],
+  deadlineAt?: number
 ): Promise<ExtractedFrame[]> {
   const id = crypto.randomBytes(8).toString("hex");
   const tmpDir = path.join(tmpdir(), `anitrace-${id}`);
@@ -368,6 +386,10 @@ export async function extractFrames(
 
     let downloaded = false;
     for (const url of urlsToTry) {
+      if (deadlineAt != null && Date.now() >= deadlineAt) {
+        console.warn("[frame-extractor] Deadline reached before download — aborting");
+        return [];
+      }
       if (await downloadVideo(url, videoPath)) {
         downloaded = true;
         break;
@@ -383,15 +405,23 @@ export async function extractFrames(
       const sceneTimestamps = IS_SERVERLESS
         ? []
         : await collectSceneTimestamps(videoPath, duration);
-      const frames = await extractFromSource(videoPath, duration, tmpDir, sceneTimestamps, "dl");
+      const frames = await extractFromSource(
+        videoPath,
+        duration,
+        tmpDir,
+        sceneTimestamps,
+        "dl",
+        deadlineAt
+      );
       console.log("[frame-extractor] Total frame variants (downloaded):", frames.length);
       return sortFramesForSearch(frames);
     }
 
     console.log("[frame-extractor] Download failed — trying direct URL extraction");
     for (const url of urlsToTry) {
+      if (deadlineAt != null && Date.now() >= deadlineAt) break;
       console.log(`[frame-extractor] Direct URL extraction: ${url.slice(0, 80)}...`);
-      const frames = await extractFromSource(url, duration, tmpDir, [], "url");
+      const frames = await extractFromSource(url, duration, tmpDir, [], "url", deadlineAt);
       if (frames.length > 0) {
         console.log(`[frame-extractor] Direct URL extraction succeeded: ${frames.length} variants`);
         return sortFramesForSearch(frames);
