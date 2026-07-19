@@ -1,19 +1,28 @@
 import { NextRequest } from "next/server";
 import { fetchTikTokVideo } from "@/lib/tikwm";
 import { searchByBuffer } from "@/lib/tracemoe";
-import { getMediaByAnilistId } from "@/lib/anilist";
-import { getAnimeById, searchAnimeByTitle, JikanAnime } from "@/lib/jikan";
+import { bytesFromDataUrl, isValidSearchImage } from "@/lib/image-bytes";
+import { getMediaByAnilistId, searchMediaByTitle, type AniListMedia } from "@/lib/anilist";
+import { getAnimeById, searchAnimeByTitle, cleanSearchTitle, JikanAnime } from "@/lib/jikan";
 import { extractFrames, framesForAiIdentification, type ExtractedFrame } from "@/lib/frame-extractor";
 import { identifyAnimeFromImages, readAnimeNamesFromSlide } from "@/lib/ai-identify";
 import {
-  fetchComments, fetchCommentReplies,
-  extractNameCandidates, extractDirectReplyCandidates, extractCandidatesFromComments,
-  isNameQuestion,
+  fetchComments,
+  extractNameCandidates, extractCandidatesFromComments,
+  collectReplyCandidates,
   type TikCommentCandidate,
 } from "@/lib/tiktok-comments";
 import { extractTitleCandidates } from "@/lib/title-parser";
 import type { AnimeResult, TraceMoeResult, IdentifyResponse } from "@/types";
 import { TIKTOK_URL_REGEX } from "@/lib/tiktok-url";
+
+export const maxDuration = 30;
+
+/** Leave headroom before Vercel's hard 30s kill. */
+const IDENTIFY_DEADLINE_MS = process.env.VERCEL ? 27_000 : 120_000;
+const MAX_TRACE_MOE_SEARCHES = process.env.VERCEL ? 10 : 36;
+/** Jikan sleep + fetch — reserve this much before starting a fallback batch. */
+const JIKAN_CALL_BUDGET_MS = 800;
 // TikTok clips often have text overlays and color grading that reduce trace.moe similarity by 5–10%.
 // Single frame needs good confidence; consensus across 2+ frames is more reliable.
 const MIN_SIMILARITY_SINGLE = 0.80;
@@ -76,6 +85,90 @@ function mapJikanToAnimeResult(
     similarity: traceMoeResult.similarity,
     matchedEpisode: traceMoeResult.episode,
   };
+}
+
+function mapAniListToAnimeResult(
+  media: AniListMedia,
+  traceMoeResult: TraceMoeResult
+): AnimeResult | null {
+  if (!media.idMal) return null;
+  const synopsis = (media.description ?? "")
+    .replace(/<br\s*\/?>/gi, "\n")
+    .replace(/<[^>]+>/g, "")
+    .trim();
+  return {
+    malId: media.idMal,
+    title: media.title.english ?? media.title.romaji,
+    titleEnglish: media.title.english ?? null,
+    titleJapanese: media.title.native ?? null,
+    imageUrl: media.coverImage?.large ?? "",
+    synopsis,
+    score: media.averageScore ? media.averageScore / 10 : 0,
+    episodes: media.episodes ?? null,
+    status: media.status ?? "Unknown",
+    rating: "Unknown",
+    season: media.season?.toLowerCase() ?? null,
+    year: media.seasonYear ?? null,
+    genres: media.genres ?? [],
+    studios: (media.studios?.nodes ?? []).map((s) => s.name),
+    malUrl: `https://myanimelist.net/anime/${media.idMal}`,
+    trailerUrl: null,
+    similarity: traceMoeResult.similarity,
+    matchedEpisode: traceMoeResult.episode,
+  };
+}
+
+/**
+ * Resolve a title to anime details — Jikan first, AniList fallback when MAL is down.
+ */
+async function resolveAnimeByTitle(
+  title: string,
+  seenMalIds: Set<number>
+): Promise<{ animeResult: AnimeResult; source: "jikan" | "anilist" } | null> {
+  const queries = [...new Set([title, cleanSearchTitle(title)].filter(Boolean))];
+
+  for (const q of queries) {
+    try {
+      const jikanAnime = await searchAnimeByTitle(q);
+      if (jikanAnime && !seenMalIds.has(jikanAnime.mal_id)) {
+        const synthetic: TraceMoeResult = {
+          anilist: 0, filename: q, episode: null,
+          from: 0, to: 0, similarity: 0, video: "", image: "",
+        };
+        return {
+          animeResult: mapJikanToAnimeResult(jikanAnime, synthetic),
+          source: "jikan",
+        };
+      }
+    } catch { /* try AniList */ }
+  }
+
+  for (const q of queries) {
+    try {
+      const media = await searchMediaByTitle(q);
+      if (!media?.idMal || seenMalIds.has(media.idMal)) continue;
+      // Prefer full Jikan details when we have a MAL id
+      const jikanAnime = await getAnimeById(media.idMal);
+      if (jikanAnime && !seenMalIds.has(jikanAnime.mal_id)) {
+        const synthetic: TraceMoeResult = {
+          anilist: 0, filename: q, episode: null,
+          from: 0, to: 0, similarity: 0, video: "", image: "",
+        };
+        return {
+          animeResult: mapJikanToAnimeResult(jikanAnime, synthetic),
+          source: "jikan",
+        };
+      }
+      const synthetic: TraceMoeResult = {
+        anilist: 0, filename: q, episode: null,
+        from: 0, to: 0, similarity: 0, video: "", image: "",
+      };
+      const animeResult = mapAniListToAnimeResult(media, synthetic);
+      if (animeResult) return { animeResult, source: "anilist" };
+    } catch { /* try next query */ }
+  }
+
+  return null;
 }
 
 interface TraceMoeGroup {
@@ -160,16 +253,23 @@ function getLowConfidenceMatches(
 }
 
 /**
- * Returns true when the candidate string shares at least one significant word
- * with the Jikan anime's titles/synonyms — guards against Jikan returning an
- * unrelated anime for a vague query like "big oppai new waifu".
+ * Returns true when the candidate meaningfully overlaps the Jikan anime title.
+ * Requires a distinctive word match — common adjectives like "cute" alone are not enough.
  */
 function titleOverlap(candidate: string, jikanAnime: JikanAnime): boolean {
+  const WEAK_WORDS = new Set([
+    "cute", "pretty", "hot", "sexy", "beautiful", "funny", "sad", "good",
+    "great", "best", "bad", "girl", "boy", "love", "dark", "blood", "new",
+    "the", "and", "for", "with", "from", "this", "that", "she", "her", "him",
+  ]);
+
   const words = candidate
     .toLowerCase()
     .replace(/[^a-z0-9\s]/g, " ")
     .split(/\s+/)
-    .filter((w) => w.length > 2);
+    .filter((w) => w.length > 2 && !WEAK_WORDS.has(w));
+
+  if (words.length === 0) return false;
 
   const haystack = [
     jikanAnime.title,
@@ -181,10 +281,78 @@ function titleOverlap(candidate: string, jikanAnime: JikanAnime): boolean {
     .toLowerCase()
     .replace(/[^a-z0-9\s]/g, " ");
 
-  return words.some((w) => haystack.includes(w));
+  // Prefer longer distinctive tokens; one weak adjective must never pass.
+  const strong = words.filter((w) => w.length >= 4);
+  const pool = strong.length > 0 ? strong : words;
+  return pool.some((w) => haystack.includes(w));
+}
+
+/** Common Japanese particles that creators omit when smushing titles into hashtags. */
+const TITLE_PARTICLES = ["ga", "no", "wo", "wa", "to", "ni", "de", "mo", "ya", "of", "the"];
+
+/**
+ * Build MAL/AniList search queries for a concatenated hashtag.
+ * e.g. "akamegakill" → "akame ga kill", "killblue" → "kill blue"
+ */
+function hashtagSearchQueries(tag: string, allowSplits: boolean): string[] {
+  if (!allowSplits || tag.length < 5) return [tag];
+
+  const particleQueries: string[] = [];
+  const splitQueries: string[] = [];
+  const lower = tag.toLowerCase();
+
+  // Particle re-insertion first: "akamegakill" → "akame ga kill"
+  for (const particle of TITLE_PARTICLES) {
+    let from = 2;
+    while (from < lower.length - particle.length - 1) {
+      const idx = lower.indexOf(particle, from);
+      if (idx < 0) break;
+      const before = tag.slice(0, idx);
+      const after = tag.slice(idx + particle.length);
+      if (before.length >= 2 && after.length >= 2) {
+        particleQueries.push(`${before} ${particle} ${after}`);
+      }
+      from = idx + 1;
+    }
+  }
+
+  // Single space splits: "killblue" → "kill blue"
+  if (tag.length <= 16) {
+    for (let i = 2; i <= tag.length - 2; i++) {
+      splitQueries.push(`${tag.slice(0, i)} ${tag.slice(i)}`);
+    }
+  }
+
+  return [...new Set([tag, ...particleQueries, ...splitQueries])];
+}
+
+async function tryTitleCandidate(
+  text: string,
+  likes: number,
+  seenMalIds: Set<number>,
+  fromNamePattern: boolean,
+  similarityForLikes: (likes: number, fromNamePattern: boolean) => number
+): Promise<{ animeResult: AnimeResult; hashtagMatch: boolean } | null> {
+  const jikanAnime = await searchAnimeByTitle(text);
+  if (!jikanAnime || seenMalIds.has(jikanAnime.mal_id)) return null;
+  if (jikanAnime.rating === "Rx - Hentai") return null;
+  if (!titleOverlap(text, jikanAnime)) return null;
+  seenMalIds.add(jikanAnime.mal_id);
+  const synthetic: TraceMoeResult = {
+    anilist: 0, filename: text, episode: null,
+    from: 0, to: 0, similarity: similarityForLikes(likes, fromNamePattern), video: "", image: "",
+  };
+  return {
+    animeResult: mapJikanToAnimeResult(jikanAnime, synthetic),
+    hashtagMatch: fromNamePattern,
+  };
 }
 
 export async function POST(request: NextRequest): Promise<Response> {
+  const startedAt = Date.now();
+  const hasTime = (reserveMs = 0) =>
+    Date.now() - startedAt < IDENTIFY_DEADLINE_MS - reserveMs;
+
   try {
     const body = await request.json();
     const { url: tiktokUrl, excludeMalIds: rawExclude } = body;
@@ -245,33 +413,41 @@ export async function POST(request: NextRequest): Promise<Response> {
       (tag) => !GENERIC_TAGS.has(tag) && tag.length >= 4 && tag.length <= 30
     );
     console.log("[identify] Title candidates:", titleCandidates, "| Hashtag candidates:", hashtagTitleCandidates);
+
+    const videoSources = [
+      videoInfo.hdVideoUrl,
+      videoInfo.tikwmProxyUrl,
+      videoInfo.videoUrl,
+      videoInfo.wmVideoUrl,
+    ].filter((u): u is string => !!u);
+    const uniqueVideoSources = [...new Set(videoSources)];
+
+    // Start slow I/O early so text early-exit and visual search overlap.
+    const framesPromise: Promise<ExtractedFrame[]> =
+      !isSlideshow
+        ? extractFrames(
+            uniqueVideoSources[0],
+            videoInfo.duration,
+            uniqueVideoSources.slice(1)
+          )
+        : Promise.resolve([]);
+
     const commentsPromise = fetchComments(tiktokUrl.trim()).then(async (comments) => {
-      // 1. Direct "name: [title]" answers — highest confidence, processed first.
+      // 1. Direct "name: [title]" / "sauce: [title]" / "it's [title]" answers.
       const nameCandidates = extractNameCandidates(comments);
 
-      // 2. "name?" questions → fetch their replies to find the answer.
-      //    Cap at 3 reply fetches to keep latency reasonable.
-      const nameQuestions = comments
-        .filter((c) => isNameQuestion(c.text) && c.replyCount > 0 && c.id)
-        .slice(0, 3);
+      // 2. Fetch replies under name/sauce questions AND high-reply threads.
+      //    Answers often live under viral comments, not only under "name?".
+      const replyNameCandidates = await collectReplyCandidates(
+        tiktokUrl.trim(),
+        comments,
+        6
+      );
 
-      const replyNameCandidates: TikCommentCandidate[] = [];
-      for (const qc of nameQuestions) {
-        const replies = await fetchCommentReplies(tiktokUrl.trim(), qc.id);
-        // extractDirectReplyCandidates handles both "name: [title]" and plain title
-        // replies (e.g. "kill blue" with 0 likes), since the name-question context
-        // is itself a strong signal that the reply is an anime title.
-        const found = extractDirectReplyCandidates(replies);
-        if (found.length > 0) {
-          console.log(`[identify] Reply answer for "${qc.text.slice(0, 40)}":`, found.map(c => c.text));
-          replyNameCandidates.push(...found);
-        }
-      }
-
-      // 3. Heuristic fallback candidates.
+      // 3. Heuristic fallback candidates from top-level comments.
       const heuristicCandidates = extractCandidatesFromComments(comments);
 
-      // Merge: name-pattern first (deduplicated), then heuristic.
+      // Merge: name-pattern / replies first (deduplicated), then heuristic.
       const seen = new Set<string>();
       const merged: TikCommentCandidate[] = [];
       for (const c of [...nameCandidates, ...replyNameCandidates, ...heuristicCandidates]) {
@@ -282,7 +458,7 @@ export async function POST(request: NextRequest): Promise<Response> {
       console.log(
         "[identify] Comment candidates:",
         merged.map((c) => `${c.text} (${c.likes}${c.fromNamePattern ? ", name-pattern" : ""})`),
-        `(from ${comments.length} comments)`
+        `(from ${comments.length} comments, ${replyNameCandidates.length} from replies)`
       );
       return merged;
     });
@@ -322,10 +498,29 @@ export async function POST(request: NextRequest): Promise<Response> {
       }
 
       const commentCandidates = await commentsPromise;
-      for (const { text, likes, fromNamePattern } of commentCandidates) {
+      // Early exit only on strong signals (name:/sauce: answers + reply titles).
+      // Weak heuristic comments wait for later fallbacks so they don't beat hashtags.
+      const strongCommentCandidates = commentCandidates.filter((c) => c.fromNamePattern);
+      for (const { text, likes, fromNamePattern } of strongCommentCandidates) {
         try {
           const jikanAnime = await searchAnimeByTitle(text);
-          if (!jikanAnime) continue;
+          if (!jikanAnime) {
+            // AniList fallback when Jikan is down / misspaced title
+            const resolved = await resolveAnimeByTitle(text, seenMalIds);
+            if (!resolved) continue;
+            if (!titleOverlap(text, {
+              title: resolved.animeResult.title,
+              title_english: resolved.animeResult.titleEnglish,
+              title_synonyms: [],
+            })) continue;
+            const similarity = fromNamePattern ? 0.93 : likes >= 50 ? 0.88 : 0.82;
+            console.log(`[identify] Early exit via comment: "${text}" (${likes} likes) → "${resolved.animeResult.title}"`);
+            resolved.animeResult.similarity = similarity;
+            return Response.json({
+              success: true,
+              results: [resolved.animeResult],
+            } satisfies IdentifyResponse);
+          }
           if (!titleOverlap(text, jikanAnime)) {
             console.log(`[identify] Comment "${text}" (${likes}) → "${jikanAnime.title}" — no overlap, skipping`);
             continue;
@@ -334,7 +529,6 @@ export async function POST(request: NextRequest): Promise<Response> {
             console.log(`[identify] Comment "${text}" (${likes}) → "${jikanAnime.title}" — excluded by user, skipping`);
             continue;
           }
-          // "name: [title]" pattern is a very strong explicit signal → boost confidence
           const similarity = fromNamePattern ? 0.93 : likes >= 50 ? 0.88 : 0.82;
           console.log(`[identify] Early exit via comment: "${text}" (${likes} likes) → "${jikanAnime.title}"`);
           const synthetic: TraceMoeResult = {
@@ -346,6 +540,41 @@ export async function POST(request: NextRequest): Promise<Response> {
             results: [mapJikanToAnimeResult(jikanAnime, synthetic)],
           } satisfies IdentifyResponse);
         } catch { /* try next */ }
+      }
+
+      // Hashtag titles (e.g. "#akamegakill" → "Akame ga Kill") — before expensive visual search.
+      // Prefer longer tags first; short ones are often character names ("esdeath", "tatsumi").
+      const earlyHashtags = [...hashtagTitleCandidates].sort((a, b) => b.length - a.length);
+      for (const tag of earlyHashtags.slice(0, 3)) {
+        // Particle splits first (cheap + high hit rate), then a few single splits.
+        const queries = hashtagSearchQueries(tag, true).slice(0, 6);
+        for (const query of queries) {
+          try {
+            const resolved = await resolveAnimeByTitle(query, seenMalIds);
+            if (!resolved) continue;
+            if (resolved.animeResult.rating === "Rx - Hentai") continue;
+            const isMatch =
+              titleOverlap(query, {
+                title: resolved.animeResult.title,
+                title_english: resolved.animeResult.titleEnglish,
+                title_synonyms: [],
+              }) ||
+              titleMatchesHashtag(
+                new Set([tag]),
+                resolved.animeResult.title,
+                resolved.animeResult.titleEnglish
+              );
+            if (!isMatch) continue;
+            console.log(
+              `[identify] Early exit via hashtag: "#${tag}" (query: "${query}") → "${resolved.animeResult.title}"`
+            );
+            resolved.animeResult.similarity = 0.90;
+            return Response.json({
+              success: true,
+              results: [resolved.animeResult],
+            } satisfies IdentifyResponse);
+          } catch { /* try next query */ }
+        }
       }
     }
 
@@ -369,14 +598,20 @@ export async function POST(request: NextRequest): Promise<Response> {
     };
 
     async function searchImageUrl(url: string, label: string) {
+      if (!hasTime()) return;
       try {
         const res = await fetch(url, { headers: BROWSER_HEADERS });
         console.log(`[identify] Fetch (${label}) status:`, res.status);
         if (!res.ok) return;
         const mimeType = res.headers.get("content-type")?.split(";")[0].trim() ?? "image/jpeg";
         const buf = await res.arrayBuffer();
-        debugImages.push(`data:${mimeType};base64,${Buffer.from(buf).toString("base64")}`);
-        const result = await searchByBuffer(buf, mimeType);
+        const bytes = new Uint8Array(buf);
+        if (!isValidSearchImage(bytes)) {
+          console.warn(`[identify] (${label}) invalid image — skipping trace.moe`);
+          return;
+        }
+        debugImages.push(`data:${mimeType};base64,${Buffer.from(bytes).toString("base64")}`);
+        const result = await searchByBuffer(bytes, mimeType);
         console.log(`[identify] (${label}) trace.moe results:`, result.result?.length ?? 0);
         if (result.result) allTraceMoeResults.push(...result.result);
       } catch (err) {
@@ -400,7 +635,8 @@ export async function POST(request: NextRequest): Promise<Response> {
           if (!res.ok) { console.warn(`[identify] (${label}) fetch failed: ${res.status}`); continue; }
           const mimeType = res.headers.get("content-type")?.split(";")[0].trim() ?? "image/jpeg";
           const buf = await res.arrayBuffer();
-          const dataUrl = `data:${mimeType};base64,${Buffer.from(buf).toString("base64")}`;
+          const bytes = new Uint8Array(buf);
+          const dataUrl = `data:${mimeType};base64,${Buffer.from(bytes).toString("base64")}`;
           debugImages.push(dataUrl);
 
           // Step A: read text printed on the slide
@@ -425,7 +661,9 @@ export async function POST(request: NextRequest): Promise<Response> {
           }
 
           // Step B: trace.moe visual fallback
-          const traceMoeResult = await searchByBuffer(buf, mimeType).catch(() => null);
+          const traceMoeResult = isValidSearchImage(bytes)
+            ? await searchByBuffer(bytes, mimeType).catch(() => null)
+            : null;
           if (traceMoeResult?.result) {
             console.log(`[identify] (${label}) trace.moe results: ${traceMoeResult.result.length}`);
             allTraceMoeResults.push(...traceMoeResult.result);
@@ -487,31 +725,27 @@ export async function POST(request: NextRequest): Promise<Response> {
     } else {
       // Regular video — multi-crop frames, biased past intro commentary
       try {
-        // Priority order: TikWM proxy (no IP restriction) → HD CDN → plain CDN → watermarked CDN
-        const altUrls = [
-          videoInfo.hdVideoUrl,
-          videoInfo.wmVideoUrl,
-        ].filter((u): u is string => !!u);
-        extractedFrames = await extractFrames(
-          videoInfo.tikwmProxyUrl, // try proxy first — immune to TikTok CDN IP-binding
-          videoInfo.duration,
-          [videoInfo.videoUrl, ...altUrls]  // CDN URLs as fallbacks
-        );
+        extractedFrames = await framesPromise;
         console.log("[identify] Extracted frame variants:", extractedFrames.length);
       } catch (err) {
         console.warn("[identify] Frame extraction error:", err);
       }
 
       let quotaDepleted = false;
+      let traceSearchCount = 0;
       for (let i = 0; i < extractedFrames.length; i++) {
-        if (quotaDepleted) break;
+        if (quotaDepleted || !hasTime() || traceSearchCount >= MAX_TRACE_MOE_SEARCHES) break;
         const { base64: frame, variant, timestampSec } = extractedFrames[i];
         debugImages.push(frame);
-        const base64Data = frame.replace(/^data:image\/[^;]+;base64,/, "");
-        const frameBuffer = Buffer.from(base64Data, "base64");
-        const frameSizeKB = Math.round(frameBuffer.length / 1024);
+        const frameBytes = bytesFromDataUrl(frame);
+        if (!frameBytes) {
+          console.warn(`[identify] Frame ${i + 1} ${variant} — invalid JPEG, skipping`);
+          continue;
+        }
+        const frameSizeKB = Math.round(frameBytes.length / 1024);
         try {
-          const result = await searchByBuffer(frameBuffer.buffer as ArrayBuffer, "image/jpeg");
+          traceSearchCount++;
+          const result = await searchByBuffer(frameBytes, "image/jpeg");
           console.log(
             `[identify] Frame ${i + 1} ${variant}@${timestampSec.toFixed(1)}s (${frameSizeKB} KB) results:`,
             result.result?.length ?? 0
@@ -528,7 +762,9 @@ export async function POST(request: NextRequest): Promise<Response> {
           }
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
-          if (msg.includes(": 402")) {
+          if (msg.includes("skipped: invalid")) {
+            console.warn(`[identify] Frame ${i + 1}: invalid image — skipping`);
+          } else if (msg.includes(": 402")) {
             console.warn(
               `[identify] Frame ${i + 1}: trace.moe daily quota depleted. ` +
               "Add TRACE_MOE_API_KEY to .env for a higher limit — see trace.moe/account"
@@ -598,6 +834,7 @@ export async function POST(request: NextRequest): Promise<Response> {
     // Step 5: Fetch anime details from Jikan for trace.moe best matches (top 5)
 
     for (const group of bestMatches.slice(0, 5)) {
+      if (!hasTime(4_000)) break;
       try {
         const anilistMedia = await getMediaByAnilistId(group.anilistId);
         let jikanAnime: JikanAnime | null = null;
@@ -645,7 +882,7 @@ export async function POST(request: NextRequest): Promise<Response> {
     // A 55 % trace.moe match + a matching hashtag is reliable — accept it.
     // In cover-only mode, accept the top low-confidence match even without hashtag
     // since there is no better visual source.
-    if (titleHashtags.size > 0 || coverOnly) {
+    if ((titleHashtags.size > 0 || coverOnly) && hasTime(3_000)) {
       const lowConfMatches = getLowConfidenceMatches(
         allTraceMoeResults,
         effectiveSingle,
@@ -653,7 +890,7 @@ export async function POST(request: NextRequest): Promise<Response> {
         coverOnly ? 0.40 : 0.45
       );
       for (const group of lowConfMatches.slice(0, 5)) {
-        if (enriched.length >= 5) break;
+        if (enriched.length >= 5 || !hasTime(2_000)) break;
         try {
           const anilistMedia = await getMediaByAnilistId(group.anilistId);
           let jikanAnime: JikanAnime | null = null;
@@ -696,35 +933,59 @@ export async function POST(request: NextRequest): Promise<Response> {
 
     // Step 5c: Pure hashtag fallback — when trace.moe had nothing above threshold
     // and no low-confidence corroboration was found, search MAL directly using hashtags.
-    if (enriched.length === 0 && titleHashtags.size > 0) {
+    if (enriched.length === 0 && titleHashtags.size > 0 && hasTime(2_000)) {
       console.log("[identify] No visual matches — falling back to pure hashtag MAL search");
-      for (const tag of titleHashtags) {
-        if (enriched.length >= 3) break;
-        if (GENERIC_TAGS.has(tag) || tag.length < 4) continue;
-        try {
-          const jikanAnime = await searchAnimeByTitle(tag);
-          if (!jikanAnime || seenMalIds.has(jikanAnime.mal_id)) continue;
-          // Accept if words overlap OR if the hashtag matches the title with spaces removed
-          // (e.g. "killblue" → "Kill Blue": "killblue" === "killblue" when normalised)
-          const isHashtagTitle = titleMatchesHashtag(
-            new Set([tag]),
-            jikanAnime.title,
-            jikanAnime.title_english,
-            ...(jikanAnime.title_synonyms ?? [])
-          );
-          if (!titleOverlap(tag, jikanAnime) && !isHashtagTitle) continue;
-          seenMalIds.add(jikanAnime.mal_id);
-          const synthetic: TraceMoeResult = {
-            anilist: 0, filename: tag, episode: null,
-            from: 0, to: 0, similarity: 0.70, video: "", image: "",
-          };
-          enriched.push({
-            animeResult: mapJikanToAnimeResult(jikanAnime, synthetic),
-            hashtagMatch: true,
-          });
-        } catch {
-          // skip
+      const lateHashtags = [...hashtagTitleCandidates].sort((a, b) => b.length - a.length);
+      for (const tag of lateHashtags) {
+        if (enriched.length >= 3 || !hasTime(JIKAN_CALL_BUDGET_MS)) break;
+        const queries = hashtagSearchQueries(tag, true).slice(0, 6);
+        let found = false;
+        for (const query of queries) {
+          if (found || !hasTime(JIKAN_CALL_BUDGET_MS)) break;
+          try {
+            const resolved = await resolveAnimeByTitle(query, seenMalIds);
+            if (!resolved) continue;
+            const isHashtagTitle = titleMatchesHashtag(
+              new Set([tag]),
+              resolved.animeResult.title,
+              resolved.animeResult.titleEnglish
+            );
+            const overlaps = titleOverlap(query, {
+              title: resolved.animeResult.title,
+              title_english: resolved.animeResult.titleEnglish,
+              title_synonyms: [],
+            });
+            if (!overlaps && !isHashtagTitle) continue;
+            seenMalIds.add(resolved.animeResult.malId);
+            resolved.animeResult.similarity = 0.70;
+            console.log(`[identify] Hashtag fallback: "#${tag}" (query: "${query}") → "${resolved.animeResult.title}"`);
+            enriched.push({
+              animeResult: resolved.animeResult,
+              hashtagMatch: true,
+            });
+            found = true;
+          } catch {
+            // skip
+          }
         }
+      }
+    }
+
+    // Step 5c½: Strong comment answers before AI — fast and often correct.
+    if (!isSlideshow && enriched.length === 0 && hasTime(3_000)) {
+      const earlyComments = await commentsPromise;
+      const strongEarly = earlyComments.filter((c) => c.fromNamePattern).slice(0, 5);
+      for (const { text, likes } of strongEarly) {
+        if (!hasTime(JIKAN_CALL_BUDGET_MS)) break;
+        try {
+          const match = await tryTitleCandidate(
+            text, likes, seenMalIds, true,
+            (l) => (l >= 50 ? 0.91 : l >= 10 ? 0.87 : 0.83)
+          );
+          if (!match) continue;
+          console.log(`[identify] Early comment answer: "${text}" (${likes} likes) → "${match.animeResult.title}"`);
+          enriched.push({ ...match, hashtagMatch: true });
+        } catch { /* skip */ }
       }
     }
 
@@ -743,44 +1004,55 @@ export async function POST(request: NextRequest): Promise<Response> {
         ? framesForAiIdentification(extractedFrames, 8)
         : debugImages;
 
-    if (shouldRunAI && aiFrameSource.length > 0) {
+    if (shouldRunAI && aiFrameSource.length > 0 && hasTime(7_000)) {
       console.log(
         `[identify] Running AI identification (enriched: ${enriched.length}, max visual: ${(maxVisualSimilarity * 100).toFixed(1)}%)`
       );
       try {
-        const aiMatch = await identifyAnimeFromImages(aiFrameSource);
+        const aiMatch = await identifyAnimeFromImages(aiFrameSource, {
+          hashtags: hashtagTitleCandidates,
+        });
         if (aiMatch && aiMatch.title) {
-          const searchTitles = [aiMatch.title, ...aiMatch.alternativeTitles].filter(Boolean);
-          let jikanAnime: JikanAnime | null = null;
+          const searchTitles = [
+            aiMatch.title,
+            ...aiMatch.alternativeTitles,
+            // Hashtags often match the AI title with spaces removed — try spaced forms too
+            ...hashtagTitleCandidates.filter((tag) => {
+              const compact = aiMatch.title.toLowerCase().replace(/[^a-z0-9]/g, "");
+              return compact.includes(tag) || tag.includes(compact.slice(0, Math.max(tag.length - 2, 4)));
+            }),
+          ].filter(Boolean);
+
+          let resolved: Awaited<ReturnType<typeof resolveAnimeByTitle>> = null;
           for (const t of searchTitles) {
-            jikanAnime = await searchAnimeByTitle(t);
-            if (jikanAnime && !seenMalIds.has(jikanAnime.mal_id)) break;
+            resolved = await resolveAnimeByTitle(t, seenMalIds);
+            if (resolved) break;
           }
-          if (jikanAnime && !seenMalIds.has(jikanAnime.mal_id)) {
-            seenMalIds.add(jikanAnime.mal_id);
+
+          if (resolved) {
+            seenMalIds.add(resolved.animeResult.malId);
             const confidenceScore =
               aiMatch.confidence === "high" ? 0.92
               : aiMatch.confidence === "medium" ? 0.78
               : 0.62;
-            const synthetic: TraceMoeResult = {
-              anilist: 0,
-              filename: aiMatch.title,
-              episode: null,
-              from: 0, to: 0,
-              similarity: confidenceScore,
-              video: "", image: "",
-            };
-            const animeResult = mapJikanToAnimeResult(jikanAnime, synthetic);
-            animeResult.similarity = confidenceScore;
+            resolved.animeResult.similarity = confidenceScore;
             const hashtagMatch = titleMatchesHashtag(
               titleHashtags,
-              jikanAnime.title,
-              jikanAnime.title_english,
+              resolved.animeResult.title,
+              resolved.animeResult.titleEnglish,
             );
-            console.log(`[identify] AI identified: ${jikanAnime.title} (${aiMatch.confidence}, score: ${confidenceScore})`);
-            // Treat "high" or "medium" AI confidence as a corroborating signal
-            // so the result sorts to the top (same bucket as hashtagMatch: true).
-            enriched.push({ animeResult, hashtagMatch: aiMatch.confidence !== "low" || hashtagMatch });
+            console.log(
+              `[identify] AI identified: ${resolved.animeResult.title} ` +
+              `(${aiMatch.confidence}, score: ${confidenceScore}, via ${resolved.source})`
+            );
+            enriched.push({
+              animeResult: resolved.animeResult,
+              hashtagMatch: aiMatch.confidence !== "low" || hashtagMatch,
+            });
+          } else {
+            console.warn(
+              `[identify] AI said "${aiMatch.title}" but Jikan/AniList lookup failed — dropping result`
+            );
           }
         }
       } catch (err) {
@@ -788,94 +1060,89 @@ export async function POST(request: NextRequest): Promise<Response> {
       }
     }
 
-    // Step 5e (non-slideshow): always merge strong comment candidates + hashtag title candidates.
-    // These are human-provided signals that override or supplement the visual result:
-    //   • Explicit "name: [title]" comments and direct replies to name-question comments
-    //   • Non-generic hashtags that ARE the anime title (e.g. "#killblue" → "Kill Blue")
-    // Run regardless of whether visual search already found something.
-    if (!isSlideshow) {
-      // 5e-i: Hashtag title candidates
-      // Hashtags concatenate words without spaces (e.g. "#killblue" for "Kill Blue").
-      // Try the raw tag first; if validation fails, try single-space splits from left to right
-      // (e.g. "kill blue" → Jikan returns "Kill Blue" → titleMatchesHashtag validates).
-      // Limited to tags ≤ 14 chars to keep the number of Jikan calls bounded.
-      for (const tag of hashtagTitleCandidates) {
-        const queries = [tag];
-        if (tag.length <= 14) {
-          for (let i = 2; i <= tag.length - 2; i++) {
-            queries.push(`${tag.slice(0, i)} ${tag.slice(i)}`);
-          }
-        }
-        let foundTag = false;
-        for (const query of queries) {
-          if (foundTag) break;
-          try {
-            const jikanAnime = await searchAnimeByTitle(query);
-            if (!jikanAnime || seenMalIds.has(jikanAnime.mal_id)) continue;
-            if (jikanAnime.rating === "Rx - Hentai") continue;
-            const isMatch = titleOverlap(query, jikanAnime) ||
-              titleMatchesHashtag(new Set([tag]), jikanAnime.title, jikanAnime.title_english, ...(jikanAnime.title_synonyms ?? []));
-            if (!isMatch) continue;
-            seenMalIds.add(jikanAnime.mal_id);
-            console.log(`[identify] Hashtag title: "#${tag}" (query: "${query}") → "${jikanAnime.title}"`);
-            const synthetic: TraceMoeResult = {
-              anilist: 0, filename: query, episode: null,
-              from: 0, to: 0, similarity: 0.88, video: "", image: "",
-            };
-            enriched.push({ animeResult: mapJikanToAnimeResult(jikanAnime, synthetic), hashtagMatch: true });
-            foundTag = true;
-          } catch { /* skip */ }
-        }
-      }
-
-      // 5e-ii: Strong comment candidates (explicit "name:" or replies to name questions)
+    // Step 5e (non-slideshow): text fallbacks when visual/AI didn't produce a result.
+    // Skip entirely when we already have matches — avoids burning the deadline on extras.
+    if (!isSlideshow && enriched.length === 0) {
       const commentCandidates = await commentsPromise;
+
+      // 5e-ii: Strong comment candidates (may already be tried in step 5c½)
       const strongCandidates = commentCandidates.filter((c) => c.fromNamePattern);
-      if (strongCandidates.length > 0) {
+      if (strongCandidates.length > 0 && enriched.length === 0) {
         console.log("[identify] Strong comment candidates:", strongCandidates.map((c) => c.text));
       }
-      for (const { text, likes } of strongCandidates) {
+      for (const { text, likes } of strongCandidates.slice(0, 5)) {
+        if (enriched.length > 0 || !hasTime(JIKAN_CALL_BUDGET_MS)) break;
         try {
-          const jikanAnime = await searchAnimeByTitle(text);
-          if (!jikanAnime || seenMalIds.has(jikanAnime.mal_id)) continue;
-          if (jikanAnime.rating === "Rx - Hentai") continue;
-          if (!titleOverlap(text, jikanAnime)) continue;
-          seenMalIds.add(jikanAnime.mal_id);
-          const similarity = likes >= 50 ? 0.91 : likes >= 10 ? 0.87 : 0.83;
-          console.log(`[identify] Comment answer: "${text}" (${likes} likes) → "${jikanAnime.title}"`);
-          const synthetic: TraceMoeResult = {
-            anilist: 0, filename: text, episode: null,
-            from: 0, to: 0, similarity, video: "", image: "",
-          };
-          enriched.push({ animeResult: mapJikanToAnimeResult(jikanAnime, synthetic), hashtagMatch: true });
+          const match = await tryTitleCandidate(
+            text, likes, seenMalIds, true,
+            (l) => (l >= 50 ? 0.91 : l >= 10 ? 0.87 : 0.83)
+          );
+          if (!match) continue;
+          console.log(`[identify] Comment answer: "${text}" (${likes} likes) → "${match.animeResult.title}"`);
+          enriched.push({ ...match, hashtagMatch: true });
         } catch { /* skip */ }
       }
 
-      // Step 5f: Weak heuristic text candidates — absolute last resort.
-      if (enriched.length === 0) {
+      // 5f: Weak heuristic text candidates — cheap, run before expensive hashtag splits.
+      if (enriched.length === 0 && hasTime(JIKAN_CALL_BUDGET_MS * 2)) {
         console.log("[identify] All methods failed — trying heuristic text candidates");
         const weakFallbacks = [
-          ...titleCandidates.map((t) => ({ text: t, likes: 0, fromNamePattern: false as const })),
           ...commentCandidates.filter((c) => !c.fromNamePattern),
-        ];
+          ...titleCandidates.map((t) => ({ text: t, likes: 0, fromNamePattern: false as const })),
+        ].slice(0, 6);
+
         for (const { text, likes } of weakFallbacks) {
+          if (!hasTime(JIKAN_CALL_BUDGET_MS)) {
+            console.log("[identify] Deadline reached during weak text fallbacks — returning");
+            break;
+          }
           try {
-            const jikanAnime = await searchAnimeByTitle(text);
-            if (!jikanAnime || seenMalIds.has(jikanAnime.mal_id)) continue;
-            if (jikanAnime.rating === "Rx - Hentai") continue;
-            if (!titleOverlap(text, jikanAnime)) continue;
-            seenMalIds.add(jikanAnime.mal_id);
-            const similarity = likes >= 50 ? 0.82 : 0.75;
-            console.log(`[identify] Weak text fallback: "${text}" → "${jikanAnime.title}"`);
-            const synthetic: TraceMoeResult = {
-              anilist: 0, filename: text, episode: null,
-              from: 0, to: 0, similarity, video: "", image: "",
-            };
-            enriched.push({ animeResult: mapJikanToAnimeResult(jikanAnime, synthetic), hashtagMatch: false });
+            const match = await tryTitleCandidate(
+              text, likes, seenMalIds, false,
+              (l) => (l >= 50 ? 0.82 : 0.75)
+            );
+            if (!match) continue;
+            console.log(`[identify] Weak text fallback: "${text}" → "${match.animeResult.title}"`);
+            enriched.push({ ...match, hashtagMatch: false });
           } catch { /* skip */ }
         }
+      } else if (enriched.length === 0) {
+        console.log("[identify] Skipping weak text fallbacks — deadline too close");
       }
+
+      // 5e-i: Hashtag title splits — expensive; only when still empty and time remains.
+      if (enriched.length === 0 && hasTime(JIKAN_CALL_BUDGET_MS * 3)) {
+        const allowSplits = hasTime(6_000);
+        for (const tag of hashtagTitleCandidates.slice(0, 3)) {
+          if (!hasTime(JIKAN_CALL_BUDGET_MS)) break;
+          const queries = hashtagSearchQueries(tag, allowSplits).slice(0, allowSplits ? 8 : 1);
+          let foundTag = false;
+          for (const query of queries) {
+            if (foundTag || !hasTime(JIKAN_CALL_BUDGET_MS)) break;
+            try {
+              const jikanAnime = await searchAnimeByTitle(query);
+              if (!jikanAnime || seenMalIds.has(jikanAnime.mal_id)) continue;
+              if (jikanAnime.rating === "Rx - Hentai") continue;
+              const isMatch = titleOverlap(query, jikanAnime) ||
+                titleMatchesHashtag(new Set([tag]), jikanAnime.title, jikanAnime.title_english, ...(jikanAnime.title_synonyms ?? []));
+              if (!isMatch) continue;
+              seenMalIds.add(jikanAnime.mal_id);
+              console.log(`[identify] Hashtag title: "#${tag}" (query: "${query}") → "${jikanAnime.title}"`);
+              const synthetic: TraceMoeResult = {
+                anilist: 0, filename: query, episode: null,
+                from: 0, to: 0, similarity: 0.88, video: "", image: "",
+              };
+              enriched.push({ animeResult: mapJikanToAnimeResult(jikanAnime, synthetic), hashtagMatch: true });
+              foundTag = true;
+            } catch { /* skip */ }
+          }
+        }
+      }
+    } else if (!isSlideshow && enriched.length > 0) {
+      console.log(`[identify] Skipping text fallbacks — ${enriched.length} match(es) already found`);
     }
+
+    console.log(`[identify] Done in ${Date.now() - startedAt}ms — ${enriched.length} result(s)`);
 
     // Sort: hashtag-confirmed results first, then by similarity
     enriched.sort((a, b) => {

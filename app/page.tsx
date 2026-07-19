@@ -417,10 +417,12 @@ export default function Home() {
                 src={src}
                 alt={`Frame ${i + 1}`}
                 style={{
-                  height: "120px",
+                  height: "200px",
+                  maxWidth: "120px",
                   borderRadius: "8px",
                   border: "1px solid var(--color-border-tertiary)",
-                  objectFit: "cover",
+                  objectFit: "contain",
+                  background: "var(--color-bg-secondary)",
                 }}
               />
             ))}

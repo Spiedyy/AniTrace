@@ -72,15 +72,22 @@ Guidelines:
 - Focus on: art style, character designs, color palette, setting, distinctive visual elements
 - Many TikToks are reaction/commentary videos: the creator may talk first, then show anime in a SMALL INSET or picture-in-picture box. Look carefully at corner insets and any small anime footage — ignore the person's face/webcam
 - Frames may be cropped to focus on inset regions — prioritize anime content over overlays
-- Ignore TikTok text overlays, usernames, and captions`;
+- Ignore TikTok text overlays, usernames, and captions
+- When TikTok hashtags are provided, treat them as strong hints: creators often write anime titles without spaces (e.g. "#akamegakil" → "Akame ga Kill", "#esdeath" → character from that series). Prefer a title that fits both the visuals AND the hashtags when they agree`;
+
+export interface IdentifyAnimeOptions {
+  /** Non-generic TikTok hashtags (e.g. "akamegakil") — often the title without spaces. */
+  hashtags?: string[];
+}
 
 /**
  * Uses Claude's vision capability to identify anime from extracted video frames.
- * Accepts up to 5 base64-encoded JPEG frames (data:image/jpeg;base64,...).
+ * Accepts up to 8 base64-encoded JPEG frames (data:image/jpeg;base64,...).
  * Returns null if the API key is missing or the call fails.
  */
 export async function identifyAnimeFromImages(
-  base64Images: string[]
+  base64Images: string[],
+  options: IdentifyAnimeOptions = {}
 ): Promise<AIAnimeMatch | null> {
   if (!process.env.ANTHROPIC_API_KEY) {
     console.log("[ai-identify] No ANTHROPIC_API_KEY set — skipping AI identification");
@@ -90,6 +97,7 @@ export async function identifyAnimeFromImages(
 
   // Use at most 8 frames — later timestamps and inset crops are sorted first
   const images = base64Images.slice(0, 8);
+  const hashtags = (options.hashtags ?? []).filter((t) => t.length >= 3).slice(0, 8);
 
   try {
     const imageBlocks: Anthropic.ImageBlockParam[] = images.map((img) => {
@@ -105,6 +113,11 @@ export async function identifyAnimeFromImages(
       };
     });
 
+    const hashtagHint =
+      hashtags.length > 0
+        ? `\n\nTikTok hashtags from the video (often anime titles or character names with spaces removed): ${hashtags.map((t) => `#${t}`).join(", ")}. Use these as hints — e.g. "#akamegakil" means "Akame ga Kill". If the frames match a hashtag title, use that title with high confidence.`
+        : "";
+
     const response = await client.messages.create({
       model: "claude-haiku-4-5-20251001",
       max_tokens: 512,
@@ -116,7 +129,7 @@ export async function identifyAnimeFromImages(
             ...imageBlocks,
             {
               type: "text",
-              text: `These are ${images.length} frame(s) from a TikTok about anime. The video may include creator commentary with anime shown in a small inset — identify the anime series, not the creator.`,
+              text: `These are ${images.length} frame(s) from a TikTok about anime. The video may include creator commentary with anime shown in a small inset — identify the anime series, not the creator.${hashtagHint}`,
             },
           ],
         },

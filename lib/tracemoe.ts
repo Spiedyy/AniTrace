@@ -1,4 +1,5 @@
 import type { TraceMoeResponse } from "@/types";
+import { isValidSearchImage, toArrayBuffer } from "@/lib/image-bytes";
 
 const BASE_URL = "https://api.trace.moe";
 
@@ -41,11 +42,20 @@ export async function searchByBase64(base64Image: string): Promise<TraceMoeRespo
  * More reliable than base64 JSON when the MIME type is unknown or large.
  */
 export async function searchByBuffer(
-  buffer: ArrayBuffer,
+  buffer: ArrayBuffer | Buffer | Uint8Array,
   mimeType: string
 ): Promise<TraceMoeResponse> {
+  const bytes =
+    buffer instanceof Buffer || buffer instanceof Uint8Array
+      ? buffer
+      : new Uint8Array(buffer);
+
+  if (!isValidSearchImage(bytes)) {
+    throw new Error("trace.moe request skipped: invalid or empty image");
+  }
+
   const form = new FormData();
-  form.append("image", new Blob([buffer], { type: mimeType }), "frame.jpg");
+  form.append("image", new Blob([toArrayBuffer(bytes)], { type: mimeType }), "frame.jpg");
 
   const response = await fetch(`${BASE_URL}/search?cutBorders=true`, {
     method: "POST",

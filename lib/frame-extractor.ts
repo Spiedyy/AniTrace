@@ -3,6 +3,10 @@ import { writeFile, readFile, rm, mkdir } from "fs/promises";
 import { tmpdir } from "os";
 import path from "path";
 import crypto from "crypto";
+import { isValidSearchImage, TRACE_MOE_MAX_BYTES } from "@/lib/image-bytes";
+
+/** Vercel functions have a hard 30s wall — keep ffmpeg work bounded. */
+const IS_SERVERLESS = !!process.env.VERCEL;
 
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 const ffmpegBin: string = require("ffmpeg-static");
@@ -14,23 +18,28 @@ const UA =
 const INTRO_SKIP_RATIO = 0.22;
 const INTRO_SKIP_MIN_S = 3;
 
-const SCALE = "scale=640:640:force_original_aspect_ratio=decrease";
+/** Native-ish TikTok frame — up to 720p, typically well under trace.moe's 1 MB cap. */
+const FULL_SCALE = "scale=720:1280:force_original_aspect_ratio=decrease";
+/** Inset crops are already zoomed — 640 px is enough for matching. */
+const CROP_SCALE = "scale=640:640:force_original_aspect_ratio=decrease";
+const FALLBACK_SCALE = "scale=640:640:force_original_aspect_ratio=decrease";
 
 /**
  * Multiple crops per timestamp — reaction videos often show anime in a small
- * inset while the creator talks full-screen.
+ * inset while the creator talks full-screen. The `full` variant is the entire
+ * TikTok frame; corner variants are fallbacks for PiP layouts.
  */
 export const FRAME_VARIANTS = {
-  full: SCALE,
+  full: FULL_SCALE,
   center:
-    "crop=iw:trunc(ih*0.70/2)*2:0:trunc(ih*0.15/2)*2," + SCALE,
+    "crop=iw:trunc(ih*0.70/2)*2:0:trunc(ih*0.15/2)*2," + CROP_SCALE,
   bottomRight:
     "crop=trunc(iw*0.48/2)*2:trunc(ih*0.48/2)*2:trunc(iw*0.52/2)*2:trunc(ih*0.52/2)*2," +
-    SCALE,
+    CROP_SCALE,
   topRight:
-    "crop=trunc(iw*0.48/2)*2:trunc(ih*0.48/2)*2:trunc(iw*0.52/2)*2:0," + SCALE,
+    "crop=trunc(iw*0.48/2)*2:trunc(ih*0.48/2)*2:trunc(iw*0.52/2)*2:0," + CROP_SCALE,
   bottomLeft:
-    "crop=trunc(iw*0.48/2)*2:trunc(ih*0.48/2)*2:0:trunc(ih*0.52/2)*2," + SCALE,
+    "crop=trunc(iw*0.48/2)*2:trunc(ih*0.48/2)*2:0:trunc(ih*0.52/2)*2," + CROP_SCALE,
 } as const;
 
 export type FrameVariant = keyof typeof FRAME_VARIANTS;
@@ -51,7 +60,7 @@ function introSkipSeconds(duration: number): number {
 
 async function spawnFfmpeg(
   args: string[],
-  timeoutMs = 60_000
+  timeoutMs = IS_SERVERLESS ? 18_000 : 60_000
 ): Promise<{ ok: boolean; stderr: string }> {
   return new Promise((resolve) => {
     const child = spawn(ffmpegBin, args);
@@ -129,7 +138,8 @@ async function captureFrame(
   seekSec: number,
   vf: string,
   framePath: string,
-  isUrl: boolean
+  isUrl: boolean,
+  jpegQuality = 4
 ): Promise<boolean> {
   const args = [
     ...(isUrl ? ["-user_agent", UA, "-headers", "Referer: https://www.tiktok.com/\r\n"] : []),
@@ -137,11 +147,11 @@ async function captureFrame(
     "-i", source,
     "-vf", vf,
     "-vframes", "1",
-    "-q:v", "4",
+    "-q:v", String(jpegQuality),
     framePath,
     "-y",
   ];
-  const { ok } = await spawnFfmpeg(args, 45_000);
+  const { ok } = await spawnFfmpeg(args, IS_SERVERLESS ? 12_000 : 45_000);
   if (!ok) return false;
   try {
     await readFile(framePath);
@@ -149,6 +159,32 @@ async function captureFrame(
   } catch {
     return false;
   }
+}
+
+async function readValidatedFrame(
+  source: string,
+  seekSec: number,
+  vf: string,
+  framePath: string,
+  isUrl: boolean,
+  variant: FrameVariant
+): Promise<Buffer | null> {
+  const quality = variant === "full" ? 4 : 5;
+  let ok = await captureFrame(source, seekSec, vf, framePath, isUrl, quality);
+  if (!ok) return null;
+
+  let raw = await readFile(framePath).catch(() => null);
+  if (!raw || !isValidSearchImage(raw)) return null;
+
+  // If 720p full frame exceeds trace.moe's 1 MB limit, retry at 640p.
+  if (raw.length > TRACE_MOE_MAX_BYTES && variant === "full") {
+    ok = await captureFrame(source, seekSec, FALLBACK_SCALE, framePath, isUrl, 5);
+    if (!ok) return null;
+    raw = await readFile(framePath).catch(() => null);
+    if (!raw || !isValidSearchImage(raw)) return null;
+  }
+
+  return raw;
 }
 
 async function extractVariantsAtTimestamp(
@@ -166,19 +202,18 @@ async function extractVariantsAtTimestamp(
       tmpDir,
       `${prefix}_${variant}_${Math.round(timestampSec * 1000)}.jpg`
     );
-    const ok = await captureFrame(
-      source,
-      timestampSec,
-      FRAME_VARIANTS[variant],
-      framePath,
-      isUrl
-    );
-    if (!ok) continue;
-
     try {
-      const base64 = (await readFile(framePath)).toString("base64");
+      const raw = await readValidatedFrame(
+        source,
+        timestampSec,
+        FRAME_VARIANTS[variant],
+        framePath,
+        isUrl,
+        variant
+      );
+      if (!raw) continue;
       frames.push({
-        base64: `data:image/jpeg;base64,${base64}`,
+        base64: `data:image/jpeg;base64,${raw.toString("base64")}`,
         variant,
         timestampSec,
       });
@@ -214,7 +249,7 @@ async function collectSceneTimestamps(
       "-fps_mode", "vfr",
       "-f", "null", "-",
     ],
-    120_000
+    IS_SERVERLESS ? 15_000 : 120_000
   );
 
   const introSkip = introSkipSeconds(duration);
@@ -230,7 +265,7 @@ async function collectSceneTimestamps(
   return dedupeTimestamps(timestamps);
 }
 
-function buildEvenTimestamps(duration: number, count: number): number[] {
+function buildEvenTimestamps(duration: number, count = IS_SERVERLESS ? 4 : 6): number[] {
   const introSkip = introSkipSeconds(duration);
   const start = Math.max(introSkip, duration * 0.25);
   const end = duration * 0.97;
@@ -244,19 +279,20 @@ function buildEvenTimestamps(duration: number, count: number): number[] {
   return timestamps;
 }
 
-/** Prefer later timestamps and PiP corner crops — common in commentary TikToks. */
+/** Prefer full frames first; PiP corner crops are fallbacks for reaction layouts. */
 export function sortFramesForSearch(frames: ExtractedFrame[]): ExtractedFrame[] {
   const variantPriority: Record<FrameVariant, number> = {
-    bottomRight: 0,
-    topRight: 1,
-    bottomLeft: 2,
-    full: 3,
-    center: 4,
+    full: 0,
+    center: 1,
+    bottomRight: 2,
+    topRight: 3,
+    bottomLeft: 4,
   };
 
   return [...frames].sort((a, b) => {
-    if (b.timestampSec !== a.timestampSec) return b.timestampSec - a.timestampSec;
-    return variantPriority[a.variant] - variantPriority[b.variant];
+    const variantDiff = variantPriority[a.variant] - variantPriority[b.variant];
+    if (variantDiff !== 0) return variantDiff;
+    return b.timestampSec - a.timestampSec;
   });
 }
 
@@ -275,12 +311,17 @@ async function extractFromSource(
   prefix: string
 ): Promise<ExtractedFrame[]> {
   const isUrl = source.startsWith("http://") || source.startsWith("https://");
-  const pipVariants: FrameVariant[] = ["bottomRight", "topRight", "full", "center"];
-  const evenVariants: FrameVariant[] = ["bottomRight", "full", "topRight"];
+  const pipVariants: FrameVariant[] = IS_SERVERLESS
+    ? ["full", "bottomRight"]
+    : ["full", "bottomRight", "topRight", "center"];
+  const evenVariants: FrameVariant[] = IS_SERVERLESS
+    ? ["full", "bottomRight"]
+    : ["full", "bottomRight", "topRight"];
 
-  const evenTimestamps = buildEvenTimestamps(duration, 6);
-  const sceneSample = dedupeTimestamps(sceneTimestamps).slice(-6);
-  const allTimestamps = dedupeTimestamps([...evenTimestamps, ...sceneSample]).slice(-10);
+  const evenTimestamps = buildEvenTimestamps(duration);
+  const sceneSample = IS_SERVERLESS ? [] : dedupeTimestamps(sceneTimestamps).slice(-6);
+  const maxTimestamps = IS_SERVERLESS ? 5 : 10;
+  const allTimestamps = dedupeTimestamps([...evenTimestamps, ...sceneSample]).slice(-maxTimestamps);
 
   console.log(
     `[frame-extractor] Sampling ${allTimestamps.length} timestamp(s):`,
@@ -339,7 +380,9 @@ export async function extractFrames(
     }
 
     if (downloaded) {
-      const sceneTimestamps = await collectSceneTimestamps(videoPath, duration);
+      const sceneTimestamps = IS_SERVERLESS
+        ? []
+        : await collectSceneTimestamps(videoPath, duration);
       const frames = await extractFromSource(videoPath, duration, tmpDir, sceneTimestamps, "dl");
       console.log("[frame-extractor] Total frame variants (downloaded):", frames.length);
       return sortFramesForSearch(frames);
