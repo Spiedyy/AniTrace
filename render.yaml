@@ -1,0 +1,24 @@
+services:
+  - type: web
+    name: anitrace
+    runtime: node
+    plan: free
+    region: frankfurt
+    buildCommand: corepack enable && pnpm install --frozen-lockfile && pnpm build
+    startCommand: pnpm start
+    healthCheckPath: /
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: NODE_OPTIONS
+        value: --max-old-space-size=384
+      - key: TRACE_MOE_API_KEY
+        sync: false
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: MAL_CLIENT_ID
+        sync: false
+      - key: MAL_CLIENT_SECRET
+        sync: false
+      - key: MAL_REDIRECT_URI
+        sync: false

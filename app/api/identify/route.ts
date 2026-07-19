@@ -18,9 +18,9 @@ import { TIKTOK_URL_REGEX } from "@/lib/tiktok-url";
 
 export const maxDuration = 60;
 
-/** Leave headroom before Vercel's hard kill (maxDuration). */
+/** Soft deadline: short on Vercel; longer on always-on hosts (e.g. Render). */
 const IDENTIFY_DEADLINE_MS = process.env.VERCEL ? 55_000 : 120_000;
-const MAX_TRACE_MOE_SEARCHES = process.env.VERCEL ? 8 : 36;
+const MAX_TRACE_MOE_SEARCHES = process.env.VERCEL ? 8 : process.env.RENDER ? 12 : 36;
 /** Jikan sleep + fetch — reserve this much before starting a fallback batch. */
 const JIKAN_CALL_BUDGET_MS = 800;
 // TikTok clips often have text overlays and color grading that reduce trace.moe similarity by 5–10%.

@@ -5,8 +5,8 @@ import path from "path";
 import crypto from "crypto";
 import { isValidSearchImage, TRACE_MOE_MAX_BYTES } from "@/lib/image-bytes";
 
-/** Vercel functions have a hard duration wall — keep ffmpeg work bounded. */
-const IS_SERVERLESS = !!process.env.VERCEL;
+/** Low-memory / time-boxed hosts (Vercel functions, Render free). */
+const IS_CONSTRAINED = !!(process.env.VERCEL || process.env.RENDER);
 
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 const ffmpegBin: string = require("ffmpeg-static");
@@ -60,7 +60,7 @@ function introSkipSeconds(duration: number): number {
 
 async function spawnFfmpeg(
   args: string[],
-  timeoutMs = IS_SERVERLESS ? 15_000 : 60_000
+  timeoutMs = IS_CONSTRAINED ? 15_000 : 60_000
 ): Promise<{ ok: boolean; stderr: string }> {
   return new Promise((resolve) => {
     const child = spawn(ffmpegBin, args);
@@ -89,7 +89,7 @@ async function spawnFfmpeg(
 
 async function downloadVideo(url: string, dest: string): Promise<boolean> {
   const controller = new AbortController();
-  const timeoutMs = IS_SERVERLESS ? 12_000 : 45_000;
+  const timeoutMs = IS_CONSTRAINED ? 12_000 : 45_000;
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
     const res = await fetch(url, {
@@ -129,7 +129,7 @@ async function downloadWithFfmpeg(url: string, dest: string): Promise<boolean> {
       "-c", "copy",
       "-y", dest,
     ],
-    IS_SERVERLESS ? 12_000 : 90_000
+    IS_CONSTRAINED ? 12_000 : 90_000
   );
   if (!ok) {
     const tail = stderr.split("\n").filter(Boolean).slice(-4).join(" | ");
@@ -158,7 +158,7 @@ async function captureFrame(
     framePath,
     "-y",
   ];
-  const { ok } = await spawnFfmpeg(args, IS_SERVERLESS ? 12_000 : 45_000);
+  const { ok } = await spawnFfmpeg(args, IS_CONSTRAINED ? 12_000 : 45_000);
   if (!ok) return false;
   try {
     await readFile(framePath);
@@ -256,7 +256,7 @@ async function collectSceneTimestamps(
       "-fps_mode", "vfr",
       "-f", "null", "-",
     ],
-    IS_SERVERLESS ? 15_000 : 120_000
+    IS_CONSTRAINED ? 15_000 : 120_000
   );
 
   const introSkip = introSkipSeconds(duration);
@@ -272,7 +272,7 @@ async function collectSceneTimestamps(
   return dedupeTimestamps(timestamps);
 }
 
-function buildEvenTimestamps(duration: number, count = IS_SERVERLESS ? 3 : 6): number[] {
+function buildEvenTimestamps(duration: number, count = IS_CONSTRAINED ? 3 : 6): number[] {
   const introSkip = introSkipSeconds(duration);
   const start = Math.max(introSkip, duration * 0.25);
   const end = duration * 0.97;
@@ -319,16 +319,16 @@ async function extractFromSource(
   deadlineAt?: number
 ): Promise<ExtractedFrame[]> {
   const isUrl = source.startsWith("http://") || source.startsWith("https://");
-  const pipVariants: FrameVariant[] = IS_SERVERLESS
+  const pipVariants: FrameVariant[] = IS_CONSTRAINED
     ? ["full", "bottomRight"]
     : ["full", "bottomRight", "topRight", "center"];
-  const evenVariants: FrameVariant[] = IS_SERVERLESS
+  const evenVariants: FrameVariant[] = IS_CONSTRAINED
     ? ["full", "bottomRight"]
     : ["full", "bottomRight", "topRight"];
 
   const evenTimestamps = buildEvenTimestamps(duration);
-  const sceneSample = IS_SERVERLESS ? [] : dedupeTimestamps(sceneTimestamps).slice(-6);
-  const maxTimestamps = IS_SERVERLESS ? 4 : 10;
+  const sceneSample = IS_CONSTRAINED ? [] : dedupeTimestamps(sceneTimestamps).slice(-6);
+  const maxTimestamps = IS_CONSTRAINED ? 4 : 10;
   const allTimestamps = dedupeTimestamps([...evenTimestamps, ...sceneSample]).slice(-maxTimestamps);
 
   console.log(
@@ -402,7 +402,7 @@ export async function extractFrames(
     }
 
     if (downloaded) {
-      const sceneTimestamps = IS_SERVERLESS
+      const sceneTimestamps = IS_CONSTRAINED
         ? []
         : await collectSceneTimestamps(videoPath, duration);
       const frames = await extractFromSource(
